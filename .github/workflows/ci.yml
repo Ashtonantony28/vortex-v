@@ -1,0 +1,56 @@
+name: CI
+
+# CI gates (both must pass):
+#   1. tests  - ISA/model/assembler pytest + cocotb RTL simulation under Icarus,
+#               including the RTL<->ISS lockstep co-sim.
+#   2. lint   - verilator --lint-only -Wall over rtl/core/files.f.
+
+# Push runs the suite only on main + tags; every other branch is covered by its
+# pull_request run, so feature branches are tested once, not twice.
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  tests:
+    name: pytest + cocotb RTL sim (gate)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install simulator (Icarus Verilog)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iverilog
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy "cocotb==2.1.0"
+
+      - name: Run tests
+        run: pytest isa/ model/ asm/ verif/ -q
+
+  lint:
+    name: Verilator lint (gate)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Verilator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq verilator
+
+      - name: Lint RTL
+        run: verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f

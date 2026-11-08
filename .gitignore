@@ -1,0 +1,87 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---- Verilator ----
+obj_dir/
+*.vcd
+*.fst
+*.fst.hier
+verilator.log
+*.verilator
+sim_build/
+# cocotb outputs
+results.xml
+dump.fst
+dump.vcd
+
+# ---- Icarus Verilog ----
+*.vvp
+*.out
+
+# ---- SymbiYosys / yosys formal ----
+*/engine_*/
+*_sby/
+*.sby.log
+
+# ---- Vivado ----
+*.jou
+*.log
+vivado*.str
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+*.srcs/sources_1/ip/*/
+*.bit
+*.bin
+*.ltx
+*.dcp
+*.rpt
+usage_statistics_webtalk.*
+webtalk*.log
+fsm_encoding.os
+.Xil
+
+# ---- Toolchain / build artifacts ----
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+*.dis
+*.lst
+
+# ---- Simulation / test output ----
+sim_out/
+waves/
+logs/
+*.tmp
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
