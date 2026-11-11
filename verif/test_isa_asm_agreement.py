@@ -3,7 +3,7 @@
 (docs/XMLACC-SPEC-v1.md). This proves they encode/decode identically, so
 there is genuinely one source of truth and not two that happen to look alike.
 
-Run: cd /mnt/project-files/vortex-v && python3 -m pytest verif/ -q
+Run: python3 -m pytest verif/ -q   (from the repo root)
 """
 import os
 import sys

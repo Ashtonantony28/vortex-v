@@ -1,7 +1,7 @@
 """
 test_core.py — cocotb directed tests + co-sim for the Vortex-V M1 RV64I core.
 
-Run with:   cd /mnt/project-files/vortex-v && python3 -m pytest verif/core/ -q
+Run with:   python3 -m pytest verif/core/ -q   (from the repo root)
 
 The pytest entry point (`test_vortex_core`) uses the cocotb runner to build the
 RTL with Icarus Verilog and run every @cocotb.test() in this module. The core is
@@ -33,7 +33,8 @@ TOHOST_ADDR = 0x8000_1000
 DATA_BASE   = 0x8000_2000
 MASK64      = (1 << 64) - 1
 
-PROJ_ROOT = Path("/mnt/project-files/vortex-v")
+# Repo root, derived from this file so the suite runs from any checkout (CI included).
+PROJ_ROOT = Path(__file__).resolve().parents[2]
 RTL_DIR   = PROJ_ROOT / "rtl" / "core"
 
 
@@ -755,31 +756,20 @@ async def xmlacc_rqs_no_sat(dut):
 # ===========================================================================
 @cocotb.test()
 async def cosim_against_iss(dut):
-    """Lockstep co-sim vs model/iss/rv64i.py if present; otherwise a no-op pass.
+    """Lockstep co-sim of the RTL against the golden ISS (model/iss/rv64i.py).
 
-    The ISS module and its exact API are owned by a sibling work stream and may
-    not exist yet. We guard import AND construction/stepping broadly so this test
-    passes trivially when the model is absent or its API differs from our guess.
+    The ISS is part of this repo, so a failure to import or construct it is a
+    test FAILURE, never a silent pass: this is the core correctness gate.
     """
     import sys
     if str(PROJ_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJ_ROOT))
-    try:
-        from model.iss import rv64i as iss_mod  # noqa
-    except Exception as e:  # ImportError or anything during import
-        dut._log.info("cosim skipped: ISS not importable (%s)", e)
-        return
+    from model.iss import rv64i as iss_mod  # noqa  (hard import: must exist)
 
-    # Construct the ISS via its documented API (Hart + Memory). Only *setup*
-    # errors (missing classes / signature drift) skip the test; once the ISS is
-    # built, the per-instruction comparison is a hard assertion — that is the
-    # whole point of the co-sim oracle (M1-INTERFACE-v1.md, M4 reuses it).
-    try:
-        Memory = iss_mod.Memory
-        Hart = iss_mod.Hart
-    except AttributeError as e:
-        dut._log.info("cosim skipped: ISS API mismatch (%s)", e)
-        return
+    # Construct the ISS via its documented API (Hart + Memory). Every step is a
+    # hard assertion (M1-INTERFACE-v1.md; M4 reuses this oracle).
+    Memory = iss_mod.Memory
+    Hart = iss_mod.Hart
 
     # Co-simulate several representative programs: ALU/*W, a taken-branch loop,
     # a load/store round trip, and a JAL/JALR call. Each runs on a fresh Hart.
@@ -906,16 +896,12 @@ async def cosim_against_iss(dut):
         else:
             asm, data = built, None
         words = asm.assemble()
-        try:
-            mem_iss = Memory(base=RESET_PC)
-            mem_iss.load_words(words, base=RESET_PC)
-            if data:
-                for addr, nbytes, val in data:
-                    mem_iss.store(addr, nbytes, val)
-            iss = Hart(mem=mem_iss, reset_pc=RESET_PC, tohost_addr=TOHOST_ADDR)
-        except TypeError as e:
-            dut._log.info("cosim skipped: ISS ctor mismatch (%s)", e)
-            return
+        mem_iss = Memory(base=RESET_PC)
+        mem_iss.load_words(words, base=RESET_PC)
+        if data:
+            for addr, nbytes, val in data:
+                mem_iss.store(addr, nbytes, val)
+        iss = Hart(mem=mem_iss, reset_pc=RESET_PC, tohost_addr=TOHOST_ADDR)
 
         retires, _mem, state = await run_program(dut, words, max_cycles=max_cycles, data=data)
         assert state["tohost"] == 1, (name, state["tohost"])
