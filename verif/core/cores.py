@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 RTL_DIR = ROOT / "rtl" / "core"
 FILELIST = RTL_DIR / "files.f"
 
-# In-order reference core. vortex_ooo_core joins at M4 (ADR 0006).
-CORES = ("vortex_core",)
+# In-order reference core and the M4 out-of-order core (ADR 0006).
+CORES = ("vortex_core", "vortex_ooo_core")
 
 
 def rtl_sources():

@@ -90,6 +90,11 @@ module vortex_core
   logic             is_xmlacc;
   xmlacc_op_e       xm_op;
   logic             dec_illegal;
+  // Source-use flags drive renaming in vortex_ooo_core; the in-order core reads
+  // the register file unconditionally, so it leaves them unused.
+  /* verilator lint_off UNUSEDSIGNAL */
+  logic             use_rs1, use_rs2, use_rs3;
+  /* verilator lint_on UNUSEDSIGNAL */
 
   vortex_decoder #(.XLEN(XLEN)) u_decoder (
     .inst          (inst),
@@ -97,6 +102,9 @@ module vortex_core
     .rs2_addr      (rs2_addr),
     .rs3_addr      (rs3_addr),
     .rd_addr       (rd_addr),
+    .use_rs1       (use_rs1),
+    .use_rs2       (use_rs2),
+    .use_rs3       (use_rs3),
     .imm           (imm),
     .alu_op        (alu_op),
     .alu_a_pc      (alu_a_pc),
@@ -199,25 +207,15 @@ module vortex_core
   );
 
   // ---------------------------------------------------------------------------
-  // Branch comparator
+  // Branch comparator (shared with vortex_ooo_core)
   // ---------------------------------------------------------------------------
-  logic cmp_eq, cmp_lt, cmp_ltu;
-  assign cmp_eq  = (rs1_data == rs2_data);
-  assign cmp_lt  = ($signed(rs1_data) < $signed(rs2_data));
-  assign cmp_ltu = (rs1_data < rs2_data);
-
   logic branch_taken;
-  always_comb begin
-    unique case (branch_f3)
-      F3_BEQ : branch_taken = cmp_eq;
-      F3_BNE : branch_taken = ~cmp_eq;
-      F3_BLT : branch_taken = cmp_lt;
-      F3_BGE : branch_taken = ~cmp_lt;
-      F3_BLTU: branch_taken = cmp_ltu;
-      F3_BGEU: branch_taken = ~cmp_ltu;
-      default: branch_taken = 1'b0;
-    endcase
-  end
+  vortex_branch_cmp #(.XLEN(XLEN)) u_branch_cmp (
+    .f3    (branch_f3),
+    .a     (rs1_data),
+    .b     (rs2_data),
+    .taken (branch_taken)
+  );
 
   // ---------------------------------------------------------------------------
   // Next-PC selection
@@ -247,20 +245,14 @@ module vortex_core
   assign dmem_size  = mem_size;
   assign dmem_wdata = rs2_data;          // right-justified; TB writes mem_size bytes
 
-  // Load data sign/zero-extension
+  // Load data sign/zero-extension (shared with vortex_ooo_core)
   logic [XLEN-1:0] load_ext;
-  always_comb begin
-    unique case (mem_size)
-      SZ_BYTE  : load_ext = load_unsigned ? {{(XLEN-8){1'b0}},            dmem_rdata[7:0]}
-                                          : {{(XLEN-8){dmem_rdata[7]}},   dmem_rdata[7:0]};
-      SZ_HALF  : load_ext = load_unsigned ? {{(XLEN-16){1'b0}},          dmem_rdata[15:0]}
-                                          : {{(XLEN-16){dmem_rdata[15]}},dmem_rdata[15:0]};
-      SZ_WORD  : load_ext = load_unsigned ? {{(XLEN-32){1'b0}},          dmem_rdata[31:0]}
-                                          : {{(XLEN-32){dmem_rdata[31]}},dmem_rdata[31:0]};
-      SZ_DOUBLE: load_ext = dmem_rdata;
-      default  : load_ext = dmem_rdata;
-    endcase
-  end
+  vortex_load_ext #(.XLEN(XLEN)) u_load_ext (
+    .size        (mem_size),
+    .is_unsigned (load_unsigned),
+    .raw         (dmem_rdata),
+    .data        (load_ext)
+  );
 
   // ---------------------------------------------------------------------------
   // Writeback mux

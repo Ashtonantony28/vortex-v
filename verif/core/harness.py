@@ -77,13 +77,14 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
 
     `data` optionally seeds the data region: list of (addr, nbytes, value).
     state["mlstat_sat"] holds the final Xmlacc SAT sticky (dbg_mlstat_sat).
+    state["cycles"] counts clock cycles from reset release to the end of the run.
 
     A fresh clock is started per call: cocotb cleans up scheduled coroutines
     between tests, so a shared clock would stop after the first test.
     """
     clk_task = cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     mem = _load_program(words, data=data)
-    state = {"halt": False, "tohost": None, "stop": False, "mlstat_sat": 0}
+    state = {"halt": False, "tohost": None, "stop": False, "mlstat_sat": 0, "cycles": 0}
 
     # Assert reset and initialise memory inputs
     dut.rst_n.value = 0
@@ -98,9 +99,10 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
     dut.rst_n.value = 1                             # release reset
 
     retires = []
-    for _ in range(max_cycles):
+    for cyc in range(max_cycles):
         await RisingEdge(dut.clk)
         await Timer(1, units="ns")
+        state["cycles"] = cyc + 1
         rv = _safe_int(dut.dbg_retire_valid, 0)
         if rv == 1:
             retires.append({
@@ -157,7 +159,7 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
     """Run `words` on the RTL and compare every retired instruction with the ISS.
 
     Each RTL retire is matched by one ISS step on (pc, writeback-valid, rd, value).
-    The run must end with a tohost PASS on both. If `mem_check=(base, nbytes)` is
+    The run must end with a tohost PASS on both, with the same mlstat.SAT. If `mem_check=(base, nbytes)` is
     given, that memory region must also match byte-for-byte at the end, so wrong
     stores are caught even if nothing reads them back.
 
@@ -191,6 +193,8 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
                 f"{name}[{i}] pc={iss_pc:#x} x{iss_rd} RTL={rtl_rec['data']:#x} ISS={iss_val:#x}"
     assert iss.halted, f"{name}: ISS did not reach the tohost store after {len(retires)} retires"
     assert iss.halt_code == (True, 0), f"{name}: ISS halt_code={iss.halt_code}"
+    assert bool(state["mlstat_sat"]) == bool(iss.mlstat & 1), \
+        f"{name}: mlstat.SAT RTL={state['mlstat_sat']} ISS={iss.mlstat & 1}"
 
     if mem_check is not None:
         base, nbytes = mem_check

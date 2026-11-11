@@ -17,6 +17,12 @@ module vortex_decoder
   output logic [4:0]           rs3_addr,   // Xmlacc R4-type (mlacc.macc) 3rd source
   output logic [4:0]           rd_addr,
 
+  // Which source registers the instruction actually reads. The rs2/rs3 fields
+  // overlap immediates in other formats; an OoO core must not wait on them.
+  output logic                 use_rs1,
+  output logic                 use_rs2,
+  output logic                 use_rs3,
+
   output logic [XLEN-1:0]      imm,
 
   output vortex_pkg::alu_op_e  alu_op,
@@ -57,6 +63,11 @@ module vortex_decoder
   assign rs2_addr = inst[24:20];
   assign rs3_addr = inst[31:27];   // R4-type rs3 field (harmless for other fmts)
   assign rd_addr  = inst[11:7];
+
+  assign use_rs1 = !((opcode == OPC_LUI) || (opcode == OPC_AUIPC) || (opcode == OPC_JAL));
+  assign use_rs2 = (opcode == OPC_OP) || (opcode == OPC_OP_W) || (opcode == OPC_STORE)
+                || (opcode == OPC_BRANCH) || (opcode == OPC_CUSTOM0);
+  assign use_rs3 = (opcode == OPC_CUSTOM0) && (funct3 == F3_MACC);
 
   // ---- Immediate forms (all sign-extended to XLEN) ----
   logic [XLEN-1:0] imm_i, imm_s, imm_b, imm_u, imm_j;

@@ -4,7 +4,8 @@ name: CI
 #   1. tests  - ISA/model/assembler pytest + cocotb RTL simulation under Icarus,
 #               including the RTL<->ISS lockstep co-sim and the riscv-tests
 #               RV64I/RV64M conformance suite (on both the ISS and the RTL).
-#   2. lint   - verilator --lint-only -Wall over rtl/core/files.f.
+#   2. lint   - verilator --lint-only -Wall over rtl/core/files.f, for both
+#               tops (vortex_core and vortex_ooo_core).
 
 # Push runs the suite only on main + tags; every other branch is covered by its
 # pull_request run, so feature branches are tested once, not twice.
@@ -54,4 +55,6 @@ jobs:
           sudo apt-get install -y -qq verilator
 
       - name: Lint RTL
-        run: verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
+        run: |
+          verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
+          verilator --lint-only -Wall --top-module vortex_ooo_core -f rtl/core/files.f
