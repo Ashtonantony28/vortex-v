@@ -6,8 +6,9 @@ A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML exten
 > **Status: M3 — in-order RV64IM core + Xmlacc Tier-1, in simulation.** There is a working
 > in-order RV64I+M core in SystemVerilog (`rtl/core/`) that runs under Icarus via cocotb and is
 > checked instruction-by-instruction against a Python ISS golden model (`model/iss/`), including
-> the five Tier-1 Xmlacc ML instructions. Not built yet: the out-of-order engine (M4+), the C
-> extension, `riscv-arch-test` conformance, Spike, FPGA bitstream, and any benchmark numbers.
+> the five Tier-1 Xmlacc ML instructions. It also passes the self-checking riscv-tests rv64ui +
+> rv64um suites (65 tests) on both the ISS and the RTL. Not built yet: the out-of-order engine
+> (M4+), the C extension, CSRs/traps, `riscv-arch-test`, Spike, FPGA bitstream, and benchmarks.
 > Every claim here is backed by a `Verify` command in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What this is
@@ -66,7 +67,7 @@ vortex-v/
 
 ## Toolchain
 
-Installed today (`scripts/setup-toolchain.sh`): Icarus, Verilator, cocotb, numpy, pytest. The rest arrive at their milestones.
+Installed today (`scripts/setup-toolchain.sh`): Icarus, Verilator, cocotb, numpy, pytest, and the RISC-V GCC cross-compiler. The rest arrive at their milestones.
 
 | Tool | Role | Notes |
 |---|---|---|
@@ -83,11 +84,11 @@ Installed today (`scripts/setup-toolchain.sh`): Icarus, Verilator, cocotb, numpy
 ## Quickstart
 
 ```bash
-# from the repo root (Ubuntu 24.04; installs iverilog, verilator, cocotb, numpy, pytest)
+# from the repo root (Ubuntu 24.04; installs iverilog, verilator, riscv64 gcc, cocotb, numpy, pytest)
 sudo scripts/setup-toolchain.sh
 
 # the two CI gates
-pytest isa/ model/ asm/ verif/ -q                                    # models + cocotb RTL co-sim
+pytest isa/ model/ asm/ verif/ -q          # models, cocotb RTL co-sim, riscv-tests on ISS + RTL
 verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
 ```
 
