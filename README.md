@@ -44,23 +44,23 @@ severity-ranked audits.
 vortex-v/
 ├── README.md                 # this file
 ├── CLAUDE.md                 # conventions for agents/contributors
-├── .gitignore
-├── .github/
-│   └── workflows/ci.yml      # Python model/ISA/asm test gate + (placeholder) RTL lint
+├── .github/workflows/ci.yml  # two gates: pytest + cocotb RTL sim, and Verilator lint
 ├── docs/
 │   ├── ROADMAP.md            # M0..M12 + stretch, with Verify commands
-│   └── adr/                  # architecture decision records
-│       ├── 0000-template.md
-│       ├── 0001-ml-engine-shape.md
-│       ├── 0002-issue-width.md
-│       ├── 0003-fpga-board.md
-│       ├── 0004-toolchain-depth.md
-│       └── 0005-verification-strategy.md
-├── rtl/                      # SystemVerilog RTL (core, pipeline, LSU, ROB, FUs, Xmlacc) — not yet populated
-├── isa/                      # Xmlacc opcode table + encoding tests (sibling-owned)
-├── model/                    # numpy golden models for ML ops (sibling-owned)
-├── asm/                      # assembler / .insn macro + builtin helpers (sibling-owned)
-└── verif/                    # cocotb testbenches + RTL<->ISS co-sim (Spike/riscv-dv later)
+│   ├── KNOWN-ISSUES.md       # open and fixed issues, with regression tests
+│   ├── XMLACC-SPEC-v1.md     # the frozen Xmlacc ISA spec
+│   ├── M1-INTERFACE-v1.md    # core port / retire contract shared by every core
+│   └── adr/                  # architecture decision records 0001-0006
+├── rtl/core/                 # in-order RV64IM + Xmlacc core; files.f is the filelist
+├── isa/                      # Xmlacc opcode table + encoding tests
+├── model/                    # numpy golden model for ML ops; model/iss = RV64IM+Xmlacc ISS
+├── asm/                      # Xmlacc assembler / .insn helpers
+├── scripts/setup-toolchain.sh
+├── third_party/riscv-tests/  # vendored rv64ui/rv64um sources (BSD-3, pinned commit)
+└── verif/
+    ├── core/                 # directed cocotb tests + lockstep co-sim; rvasm, harness, cores
+    ├── conformance/          # riscv-tests on the ISS and on every core
+    └── crv/                  # seeded constrained-random programs, co-simmed vs the ISS
 ```
 
 `rtl/core/files.f` is the RTL filelist shared by lint and simulation.
@@ -88,7 +88,7 @@ Installed today (`scripts/setup-toolchain.sh`): Icarus, Verilator, cocotb, numpy
 sudo scripts/setup-toolchain.sh
 
 # the two CI gates
-pytest isa/ model/ asm/ verif/ -q          # models, cocotb RTL co-sim, riscv-tests on ISS + RTL
+pytest isa/ model/ asm/ verif/ -q          # models, RTL co-sim, riscv-tests, random co-sim
 verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
 ```
 
