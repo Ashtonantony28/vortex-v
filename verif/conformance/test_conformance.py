@@ -32,13 +32,15 @@ ROOT = HERE.parents[1]
 TESTS_SRC = ROOT / "third_party" / "riscv-tests" / "isa"
 ENV_DIR = HERE / "rvtest_env"
 BUILD_DIR = HERE / "build"
-RTL_DIR = ROOT / "rtl" / "core"
 
 RESET_PC = 0x8000_0000
 TOHOST_ADDR = 0x8000_1000
 SUITES = ("rv64ui", "rv64um")
 GCC = "riscv64-unknown-elf-gcc"
 OBJCOPY = "riscv64-unknown-elf-objcopy"
+
+sys.path.insert(0, str(ROOT / "verif" / "core"))
+from cores import CORES  # noqa: E402
 
 # Tests not run, with the reason. Revisit each when its prerequisite lands.
 EXCLUDED = {
@@ -133,7 +135,7 @@ if cocotb is not None:
     async def conformance_rtl(dut):
         """Run every built riscv-tests image on the RTL; report all failures by name."""
         sys.path.insert(0, str(ROOT / "verif" / "core"))
-        from test_core import run_program  # shared memory model + run harness
+        from harness import run_program  # shared memory model + run harness
 
         build_dir = Path(os.environ["VORTEX_CONF_BUILD"])
         names = os.environ["VORTEX_CONF_TESTS"].split(",")
@@ -152,23 +154,12 @@ if cocotb is not None:
         assert not failures, "RTL conformance failures:\n  " + "\n  ".join(failures)
 
 
-def test_rtl_conformance(built):
-    try:
-        from cocotb_tools.runner import get_runner
-    except ImportError:  # older cocotb
-        from cocotb.runner import get_runner
-
-    sources = [RTL_DIR / line.strip().split("/")[-1]
-               for line in (RTL_DIR / "files.f").read_text().splitlines() if line.strip()]
-    sim_build = HERE / "sim_build"
-    os.environ["PYTHONPATH"] = os.pathsep.join(
-        [str(HERE), str(ROOT / "verif" / "core"), os.environ.get("PYTHONPATH", "")])
-    os.environ["VORTEX_CONF_BUILD"] = str(BUILD_DIR)
-    os.environ["VORTEX_CONF_TESTS"] = ",".join(RUN_NAMES)
-
-    runner = get_runner(os.getenv("SIM", "icarus"))
-    runner.build(sources=[str(s) for s in sources], hdl_toplevel="vortex_core",
-                 build_dir=str(sim_build), always=True, timescale=("1ns", "1ps"))
-    # runner.test raises (SystemExit) if any cocotb test fails, failing this pytest.
-    runner.test(hdl_toplevel="vortex_core", test_module="test_conformance",
-                build_dir=str(sim_build), test_dir=str(HERE), timescale=("1ns", "1ps"))
+@pytest.mark.parametrize("toplevel", CORES)
+def test_rtl_conformance(built, toplevel):
+    """Run every riscv-tests image on `toplevel` (each core in verif/core/cores.py)."""
+    sys.path.insert(0, str(ROOT / "verif" / "core"))
+    from cores import build_and_test
+    build_and_test(toplevel, "test_conformance", HERE,
+                   extra_pythonpath=[ROOT / "verif" / "core"],
+                   env={"VORTEX_CONF_BUILD": str(BUILD_DIR),
+                        "VORTEX_CONF_TESTS": ",".join(RUN_NAMES)})
