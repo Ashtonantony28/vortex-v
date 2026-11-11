@@ -25,3 +25,16 @@ correctness failures — the full suite is green — but they're real and owned.
   Regression coverage: directed cocotb test `xmlacc_rqs_round_overflow`, co-sim programs
   `rqs_edges` (INT64_MAX/MIN x 5 shifts) and `rqs_random` (64 seeded full-range values x every
   shift 0..63). Each fails on the old RTL and passes on the fix.
+
+## M4
+- **I6 (performance, by design for now):** the OoO core reuses the shared `vortex_muldiv` unit
+  for both its multiplier and its divider (two instances; ADR 0006 "shared, never copied"). That
+  unit takes a multiply in one cycle and returns it the next, so a multiply has 2-cycle latency
+  and 1-per-2-cycles throughput, not the 1-cycle multiplier ADR 0006 item 5 describes. Results are
+  correct; only overlap is lower. Fix with a pipelined multiplier when M5 widens issue.
+- **I7 (performance, by design for M4):** commit is 1 per cycle and the in-order core already
+  runs ALU ops at 1 per cycle, so OoO only wins where multi-cycle units overlap (`test_ooo.py`
+  uses multiplies behind a divide). Wider commit (M5) and speculation (M6) are where IPC grows.
+- **I8 (verification gap):** `dbg_ooo_completions` counts only single-cycle and multiplier
+  completions; divider and load completions ahead of older work are not counted. It is a proof
+  aid, not a performance counter.

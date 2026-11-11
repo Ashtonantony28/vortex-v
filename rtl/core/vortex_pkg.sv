@@ -116,5 +116,14 @@ package vortex_pkg;
     MD_REMU   = 3'b111  // REMU / REMUW  : unsigned remainder
   } md_op_e;
 
+  // ---- vortex_ooo_core functional-unit class of an issue-queue entry (ADR 0006) ----
+  typedef enum logic [2:0] {
+    FU_ALU,  // ALU, branches, JAL/JALR (1 cycle)
+    FU_MUL,  // RV64M multiplies
+    FU_DIV,  // RV64M divides/remainders (iterative, one in flight)
+    FU_XM,   // Xmlacc ops (1 cycle)
+    FU_AGU   // load/store address + store data into the memory queue
+  } fu_e;
+
 endpackage : vortex_pkg
 `endif

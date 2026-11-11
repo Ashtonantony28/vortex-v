@@ -3,12 +3,14 @@
 A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML extension
 (**Xmlacc**), targeting a **Digilent Arty A7-100T** FPGA and running TinyML kernels.
 
-> **Status: M3 — in-order RV64IM core + Xmlacc Tier-1, in simulation.** There is a working
-> in-order RV64I+M core in SystemVerilog (`rtl/core/`) that runs under Icarus via cocotb and is
-> checked instruction-by-instruction against a Python ISS golden model (`model/iss/`), including
-> the five Tier-1 Xmlacc ML instructions. It also passes the self-checking riscv-tests rv64ui +
-> rv64um suites (65 tests) on both the ISS and the RTL. Not built yet: the out-of-order engine
-> (M4+), the C extension, CSRs/traps, `riscv-arch-test`, Spike, FPGA bitstream, and benchmarks.
+> **Status: M4 — single-issue out-of-order RV64IM + Xmlacc core, in simulation.** Two cores
+> with the same ports live in `rtl/core/`: the in-order reference `vortex_core` and the
+> out-of-order `vortex_ooo_core` (register renaming, 32-entry ROB, issue queue, separate
+> multiplier/divider/Xmlacc units, no speculation yet; ADR 0006). Both run under Icarus via
+> cocotb and are checked instruction-by-instruction against a Python ISS golden model
+> (`model/iss/`), on directed tests, the riscv-tests rv64ui + rv64um suites (65 tests), and
+> seeded constrained-random programs. Not built yet: 2-wide issue (M5), speculation (M6), the
+> C extension, CSRs/traps, `riscv-arch-test`, Spike, FPGA bitstream, and benchmarks.
 > Every claim here is backed by a `Verify` command in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What this is
@@ -51,7 +53,7 @@ vortex-v/
 │   ├── XMLACC-SPEC-v1.md     # the frozen Xmlacc ISA spec
 │   ├── M1-INTERFACE-v1.md    # core port / retire contract shared by every core
 │   └── adr/                  # architecture decision records 0001-0006
-├── rtl/core/                 # in-order RV64IM + Xmlacc core; files.f is the filelist
+├── rtl/core/                 # in-order + out-of-order RV64IM + Xmlacc cores; files.f is the filelist
 ├── isa/                      # Xmlacc opcode table + encoding tests
 ├── model/                    # numpy golden model for ML ops; model/iss = RV64IM+Xmlacc ISS
 ├── asm/                      # Xmlacc assembler / .insn helpers
@@ -90,6 +92,7 @@ sudo scripts/setup-toolchain.sh
 # the two CI gates
 pytest isa/ model/ asm/ verif/ -q          # models, RTL co-sim, riscv-tests, random co-sim
 verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
+verilator --lint-only -Wall --top-module vortex_ooo_core -f rtl/core/files.f
 ```
 
 ## Roadmap
