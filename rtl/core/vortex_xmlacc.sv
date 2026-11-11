@@ -8,7 +8,7 @@
 //   dot8u  : rd = ZX64( sum_{i}     zext8(rs1[i]) * zext8(rs2[i]) )
 //   dot8su : rd = SX64( sum_{i}     sext8(rs1[i]) * zext8(rs2[i]) )
 //   macc   : rd = rs3 + sum_{i} sext8(rs1[i]) * sext8(rs2[i])   (64-bit wrap)
-//   rqs    : sh=rs2[5:0]; t=(rs1 + (sh? 1<<(sh-1):0)) >>>s sh;
+//   rqs    : sh=rs2[5:0]; t=(rs1 + (sh? 1<<(sh-1):0)) >>>s sh  (in XLEN+1 bits);
 //            rd = SX64(clamp(t,-128,127)); SAT=1 if the clamp fired.
 //
 // A GP register packs 8 int8 lanes, lane i = bits [8i+7:8i] (byte 0 = [7:0]).
@@ -93,23 +93,31 @@ module vortex_xmlacc
   // -------------------------------------------------------------------------
   // rqs: round-half-up, arithmetic shift right, clamp to int8, sticky SAT.
   // -------------------------------------------------------------------------
+  // The rounding add needs one guard bit: rs1 can be as large as 2^63-1 and rnd
+  // as large as 2^62, so rs1 + rnd reaches ~1.5 * 2^63 and wraps in XLEN bits.
+  // The golden model computes in unbounded precision (KNOWN-ISSUES I5).
+  localparam int RQS_W = XLEN + 1;
+  localparam logic signed [RQS_W-1:0] RQS_ONE      = RQS_W'(1);
+  localparam logic signed [RQS_W-1:0] INT8_MAX_EXT = RQS_W'(127);
+  localparam logic signed [RQS_W-1:0] INT8_MIN_EXT = -RQS_W'(128);
+
   logic [5:0]              sh;
-  logic signed [XLEN-1:0]  x_s;        // rs1 as signed 64
-  logic signed [XLEN-1:0]  rnd;        // 1<<(sh-1) if sh>0 else 0
-  logic signed [XLEN-1:0]  t;          // (x + rnd) >>> sh
+  logic signed [RQS_W-1:0] x_ext;      // rs1 sign-extended to XLEN+1
+  logic signed [RQS_W-1:0] rnd;        // 1<<(sh-1) if sh>0 else 0
+  logic signed [RQS_W-1:0] t;          // (x + rnd) >>> sh, no overflow possible
   logic signed [7:0]       clamped;    // final int8 result
   logic                    rqs_sat;
 
-  assign sh  = rs2[5:0];
-  assign x_s = rs1;
-  assign rnd = (sh != 6'd0) ? (64'sd1 <<< (sh - 6'd1)) : 64'sd0;
-  assign t   = (x_s + rnd) >>> sh;
+  assign sh    = rs2[5:0];
+  assign x_ext = {rs1[XLEN-1], rs1};
+  assign rnd   = (sh != 6'd0) ? (RQS_ONE <<< (sh - 6'd1)) : '0;
+  assign t     = (x_ext + rnd) >>> sh;
 
   always_comb begin
-    if (t < -64'sd128) begin
+    if (t < INT8_MIN_EXT) begin
       clamped = -8'sd128;
       rqs_sat = 1'b1;
-    end else if (t > 64'sd127) begin
+    end else if (t > INT8_MAX_EXT) begin
       clamped = 8'sd127;
       rqs_sat = 1'b1;
     end else begin

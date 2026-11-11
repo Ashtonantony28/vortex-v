@@ -18,11 +18,10 @@ correctness failures — the full suite is green — but they're real and owned.
   is clean. Revisit if we drop iverilog.
 
 ## M3
-- **I5 (BUG, open — found by the UVM verification thread):** `rqs` rounding add can
-  overflow in RTL. `rtl/core/vortex_xmlacc.sv` line ~106 computes `t = (x_s + rnd) >>> sh`
-  in 64 bits, with `rnd` up to `1<<62`. When `rs1` is near the positive 64-bit limit,
-  `x_s + rnd` wraps, so the shifted value and the clamp/SAT come out wrong. The Python ISS and
-  numpy golden model use unbounded ints, so they don't wrap, and RTL disagrees with them in
-  this corner. The co-sim vectors never reached it. **Fix:** sign-extend `x_s` and `rnd` to
-  65 bits, add and shift in 65 bits, then clamp. Add a directed test plus a co-sim vector with
-  large `rs1` and `sh` near 63.
+- **I5 (BUG, FIXED in `fix-rqs-round-overflow`; found by the UVM verification thread):** the
+  `rqs` rounding add in `rtl/core/vortex_xmlacc.sv` was 64 bits wide. With `rs1` near INT64_MAX,
+  `rs1 + (1<<(sh-1))` wrapped negative before the shift, e.g. `rqs(INT64_MAX, sh=63)` returned -1
+  instead of 1, and `sh=1` clamped LOW (-128) instead of HIGH (+127). Now computed in XLEN+1 bits.
+  Regression coverage: directed cocotb test `xmlacc_rqs_round_overflow`, co-sim programs
+  `rqs_edges` (INT64_MAX/MIN x 5 shifts) and `rqs_random` (64 seeded full-range values x every
+  shift 0..63). Each fails on the old RTL and passes on the fix.

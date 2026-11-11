@@ -751,6 +751,57 @@ async def xmlacc_rqs_no_sat(dut):
     dut._log.info("xmlacc_rqs_no_sat: rqs=%d SAT=0 PASS", exp)
 
 
+INT64_MAX = (1 << 63) - 1
+INT64_MIN = 1 << 63          # as an unsigned 64-bit pattern
+
+
+@cocotb.test()
+async def xmlacc_rqs_round_overflow(dut):
+    """rqs rounding must not overflow: rs1 + (1<<(sh-1)) needs 65 bits (KNOWN-ISSUES I5).
+
+    With rs1 near INT64_MAX a 64-bit add wraps negative before the shift. The
+    spec/golden model compute in unbounded precision, so e.g. INT64_MAX with sh=63
+    must give 1 (not -1) and with sh=1 must saturate HIGH to +127 (not -128).
+    """
+    d = DATA_BASE
+    data = [(d + 0, 8, INT64_MAX), (d + 8, 8, INT64_MIN)]
+    cases_nosat = [(10, 0, 63), (11, 0, 62), (12, 8, 63)]   # (rd, data offset, sh)
+    a = Asm()
+    a.la(30, DATA_BASE)
+    a.ld(1, 30, 0); a.ld(2, 30, 8)
+    a.addi(5, 0, 63); a.addi(6, 0, 62)
+    a.rqs(10, 1, 5)      # INT64_MAX, sh=63 -> 1
+    a.rqs(11, 1, 6)      # INT64_MAX, sh=62 -> 2
+    a.rqs(12, 2, 5)      # INT64_MIN, sh=63 -> -1
+    a.la(31, TOHOST_ADDR); a.addi(9, 0, 1); a.sw(9, 31, 0)
+    retires, _mem, state = await run_program(dut, a.assemble(), data=data)
+    assert state["tohost"] == 1, state["tohost"]
+    regs = final_regs(retires)
+    srcs = {0: INT64_MAX, 8: INT64_MIN}
+    for rd, off, sh in cases_nosat:
+        exp, sat = _ref_rqs(srcs[off], sh)
+        assert sat is False
+        got = sext(regs[rd], 64)
+        assert got == exp, "rqs(0x%016X, sh=%d): RTL=%d expected=%d" % (srcs[off], sh, got, exp)
+    assert state["mlstat_sat"] == 0, "none of these clamp, SAT must stay 0"
+
+    # Second program: INT64_MAX with sh=1 rounds to 2^62 and must clamp HIGH.
+    a = Asm()
+    a.la(30, DATA_BASE)
+    a.ld(1, 30, 0)
+    a.addi(5, 0, 1)
+    a.rqs(10, 1, 5)      # INT64_MAX, sh=1 -> +127, SAT
+    a.la(31, TOHOST_ADDR); a.addi(9, 0, 1); a.sw(9, 31, 0)
+    retires, _mem, state = await run_program(dut, a.assemble(), data=data)
+    assert state["tohost"] == 1, state["tohost"]
+    exp, sat = _ref_rqs(INT64_MAX, 1)
+    assert (exp, sat) == (127, True)
+    got = sext(final_regs(retires)[10], 64)
+    assert got == 127, "rqs(INT64_MAX, sh=1): RTL=%d expected=+127" % got
+    assert state["mlstat_sat"] == 1, "clamp fired, SAT must be set"
+    dut._log.info("xmlacc_rqs_round_overflow: 65-bit rounding correct PASS")
+
+
 # ===========================================================================
 # Optional co-simulation against the Python ISS (guarded)
 # ===========================================================================
@@ -883,10 +934,55 @@ async def cosim_against_iss(dut):
         a.la(31, TOHOST_ADDR); a.addi(28, 0, 1); a.sw(28, 31, 0)
         return a, data
 
+    def prog_rqs_edges():
+        # rqs at the 64-bit extremes: rounding must be computed in 65 bits (I5).
+        d = DATA_BASE
+        data = [(d + 0, 8, (1 << 63) - 1), (d + 8, 8, 1 << 63)]
+        a = Asm()
+        a.la(30, DATA_BASE)
+        a.ld(1, 30, 0); a.ld(2, 30, 8)
+        for i, sh in enumerate((63, 62, 32, 2, 1)):
+            a.addi(5, 0, sh)
+            a.rqs(10 + i, 1, 5)              # INT64_MAX
+            a.rqs(20 + i, 2, 5)              # INT64_MIN
+        a.la(31, TOHOST_ADDR); a.addi(28, 0, 1); a.sw(28, 31, 0)
+        return a, data
+
+    def prog_rqs_random():
+        # Seeded sweep: full 64-bit rs1 (biased toward the extremes) x every shift
+        # 0..63, so rqs rounding/clamp corners beyond the hand-picked ones are hit.
+        import random
+        rng = random.Random(0x5EED_0005)
+        n = 64
+        vals = []
+        for i in range(n):
+            kind = i % 4
+            if kind == 0:
+                v = rng.getrandbits(64)                          # anywhere
+            elif kind == 1:
+                v = ((1 << 63) - 1 - rng.getrandbits(20))        # just below INT64_MAX
+            elif kind == 2:
+                v = (1 << 63) + rng.getrandbits(20)              # just above INT64_MIN
+            else:
+                v = rng.getrandbits(40) - (1 << 39)              # int40-ish around 0
+            vals.append(v & MASK64)
+        d = DATA_BASE
+        data = [(d + 8 * i, 8, v) for i, v in enumerate(vals)]
+        a = Asm()
+        a.la(30, DATA_BASE)
+        for i in range(n):
+            a.ld(1, 30, 8 * i)
+            a.addi(5, 0, i % 64)             # every shift amount 0..63 is used
+            a.rqs(10, 1, 5)
+        a.la(31, TOHOST_ADDR); a.addi(28, 0, 1); a.sw(28, 31, 0)
+        return a, data
+
     # (name, builder, max_cycles) — divides are multi-cycle so give muldiv room.
     programs = [("arith", prog_arith, 2000), ("loop", prog_loop, 2000),
                 ("ldst", prog_ldst, 2000), ("call", prog_call, 2000),
-                ("muldiv", prog_muldiv, 6000), ("xmlacc", prog_xmlacc, 2000)]
+                ("muldiv", prog_muldiv, 6000), ("xmlacc", prog_xmlacc, 2000),
+                ("rqs_edges", prog_rqs_edges, 2000),
+                ("rqs_random", prog_rqs_random, 4000)]
 
     n_xmlacc_compared = 0
     for name, builder, max_cycles in programs:
