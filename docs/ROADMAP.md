@@ -13,7 +13,7 @@ Legend: `[~]` in progress · `[ ]` not started · `[x]` done
 | # | Status | Milestone | Deliverable | Verify command |
 |---|--------|-----------|-------------|----------------|
 | M0 | `[x]` | Scaffolding | Repo skeleton, ADRs 0001–0005, roadmap, ISA table, numpy golden model, assembler, CI | `pytest isa/ model/ asm/ verif/ -q` |
-| M1 | `[~]` | In-order RV64IMC | **Done:** in-order RV64I + RV64M core in RTL, Python ISS golden model, cocotb lockstep co-sim vs ISS. **Left:** C extension, `riscv-arch-test` (needs RISC-V GNU toolchain) | `pytest verif/core/ -q` (cocotb RTL vs ISS, retire-by-retire) |
+| M1 | `[~]` | In-order RV64IMC | **Done:** in-order RV64I + RV64M core in RTL, Python ISS golden model, cocotb lockstep co-sim vs ISS, and the self-checking **riscv-tests** rv64ui + rv64um suites (65 tests) passing on both ISS and RTL. **Left:** C extension; Zicsr + traps (unblocks `fence_i`, `ma_data`); the signature-based `riscv-arch-test` suite | `pytest verif/core/ verif/conformance/ -q` |
 | M2 | `[ ]` | Spike Xmlacc plugin + golden | Spike extended with Xmlacc plugin; numpy golden models wired as the oracle; shared bit-exact fixtures | `pytest model/ -q && spike --isa=rv64gc_xmlacc --extlib=build/xmlacc.so ...` (plugin matches golden on fixtures) |
 | M3 | `[x]` | Tier-1 ML ops (in-order) | Xmlacc Tier-1 int8 dot-product / fused macc / requantize in ISS + in-order core; co-sim vs ISS, ISS cross-checked vs numpy golden. RTL CSR decode for mlstat deferred (SAT on a debug port) | `pytest model/ verif/core/ -q` |
 | M4 | `[ ]` | OoO scalar | Rename + ROB + single-issue out-of-order execution; riscv-dv co-sim brought online | `make cosim RISCV_DV=1` (riscv-dv constrained-random lockstep vs Spike, N seeds green) |

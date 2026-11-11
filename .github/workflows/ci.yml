@@ -2,7 +2,8 @@ name: CI
 
 # CI gates (both must pass):
 #   1. tests  - ISA/model/assembler pytest + cocotb RTL simulation under Icarus,
-#               including the RTL<->ISS lockstep co-sim.
+#               including the RTL<->ISS lockstep co-sim and the riscv-tests
+#               RV64I/RV64M conformance suite (on both the ISS and the RTL).
 #   2. lint   - verilator --lint-only -Wall over rtl/core/files.f.
 
 # Push runs the suite only on main + tags; every other branch is covered by its
@@ -27,10 +28,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install simulator (Icarus Verilog)
+      - name: Install simulator (Icarus Verilog) and RISC-V cross-compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iverilog
+          sudo apt-get install -y -qq iverilog gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
 
       - name: Install Python dependencies
         run: |

@@ -5,8 +5,9 @@
 set -euo pipefail
 apt-get update -qq
 apt-get install -y -qq iverilog verilator   # Icarus 12.0, Verilator 5.020
+apt-get install -y -qq gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf   # GCC 13.2, for riscv-tests
 python3 -m pip install -q --upgrade pip
 python3 -m pip install -q cocotb numpy pytest
-echo "Installed:"; iverilog -V | head -1; verilator --version; python3 -c "import cocotb; print('cocotb', cocotb.__version__)"
+echo "Installed:"; iverilog -V | head -1; verilator --version; riscv64-unknown-elf-gcc --version | head -1; python3 -c "import cocotb; print('cocotb', cocotb.__version__)"
 # Deferred (added at their milestones): Spike (riscv-isa-sim) for M2 golden co-sim,
-# riscv-dv for M4 random co-sim, SymbiYosys for M7 formal, a riscv-gnu-toolchain for M1.1.
+# riscv-dv for M4 random co-sim, SymbiYosys for M7 formal.
