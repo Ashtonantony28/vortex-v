@@ -25,6 +25,7 @@ module vortex_soc
   parameter int unsigned      SPEC_BRANCHES = 0,
   parameter int unsigned      LSQ           = 0,
   parameter int unsigned      XM_LATENCY    = 1,
+  parameter int unsigned      SYNC_MEM      = 0,      // 1 = block-RAM-style memory (ADR 0012)
   parameter int unsigned      RAM_BYTES     = 16384,
   parameter logic [XLEN-1:0]  RAM_BASE      = 64'h8000_0000,
   parameter logic [XLEN-1:0]  TOHOST_ADDR   = 64'h8000_1000,
@@ -48,6 +49,11 @@ module vortex_soc
   localparam logic [MMW-1:0] REG_CYCLE       = MMW'(5'h18);
   localparam logic [XLEN-1:0] TOHOST_PASS    = XLEN'(1);
 
+  initial begin
+    if (SYNC_MEM != 0 && !CORE_OOO)
+      $fatal(1, "vortex_soc: SYNC_MEM needs the out-of-order core (ADR 0012)");
+  end
+
   // ---- Core ----
   logic [XLEN-1:0] imem_addr, imem_addr1;
   logic [31:0]     imem_rdata, imem_rdata1;
@@ -65,7 +71,8 @@ module vortex_soc
       .WIDTH         (WIDTH),
       .SPEC_BRANCHES (SPEC_BRANCHES),
       .LSQ           (LSQ),
-      .XM_LATENCY    (XM_LATENCY)
+      .XM_LATENCY    (XM_LATENCY),
+      .SYNC_MEM      (SYNC_MEM)
     ) u_core (
       .clk               (clk),
       .rst_n             (rst_n),
@@ -133,7 +140,8 @@ module vortex_soc
     .XLEN      (XLEN),
     .BYTES     (RAM_BYTES),
     .BASE      (RAM_BASE),
-    .INIT_FILE (INIT_FILE)
+    .INIT_FILE (INIT_FILE),
+    .SYNC      (SYNC_MEM != 0)
   ) u_ram (
     .clk    (clk),
     .iaddr0 (imem_addr),
@@ -173,7 +181,18 @@ module vortex_soc
       default:         mmio_rdata = '0;
     endcase
   end
-  assign dmem_rdata = sel_ram ? ram_rdata : sel_mmio ? mmio_rdata : '0;
+  // With SYNC_MEM the RAM answers a cycle late, so the MMIO data and the
+  // select are registered to line up with it.
+  logic            sel_ram_q, sel_mmio_q;
+  logic [XLEN-1:0] mmio_rdata_q;
+  always_ff @(posedge clk) begin
+    sel_ram_q    <= sel_ram;
+    sel_mmio_q   <= sel_mmio;
+    mmio_rdata_q <= mmio_rdata;
+  end
+  assign dmem_rdata = (SYNC_MEM != 0)
+                    ? (sel_ram_q ? ram_rdata : sel_mmio_q ? mmio_rdata_q : '0)
+                    : (sel_ram   ? ram_rdata : sel_mmio   ? mmio_rdata   : '0);
 
   // Asynchronous active-low reset, like the core (the FPGA top synchronises its release).
   always_ff @(posedge clk or negedge rst_n) begin

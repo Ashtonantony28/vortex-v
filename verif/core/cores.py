@@ -15,7 +15,7 @@ FILELIST = RTL_DIR / "files.f"
 # core, the M4 out-of-order core (ADR 0006), the same core two-wide (ADR 0007), and
 # two-wide with branch prediction and speculation (ADR 0008), and that plus the
 # load/store queue with store-to-load forwarding (ADR 0009), and that plus a
-# pipelined Xmlacc unit (ADR 0010).
+# pipelined Xmlacc unit (ADR 0010), and that with block-RAM-style memory (ADR 0012).
 CORE_CONFIGS = {
     "vortex_core": ("vortex_core", {}),
     "vortex_ooo_core": ("vortex_ooo_core", {}),
@@ -24,6 +24,8 @@ CORE_CONFIGS = {
     "vortex_ooo_core_lsq": ("vortex_ooo_core", {"WIDTH": 2, "SPEC_BRANCHES": 1, "LSQ": 1}),
     "vortex_ooo_core_xm": ("vortex_ooo_core", {"WIDTH": 2, "SPEC_BRANCHES": 1, "LSQ": 1,
                                                "XM_LATENCY": 3}),
+    "vortex_ooo_core_sync": ("vortex_ooo_core", {"WIDTH": 2, "SPEC_BRANCHES": 1, "LSQ": 1,
+                                                 "XM_LATENCY": 3, "SYNC_MEM": 1}),
 }
 CORES = tuple(CORE_CONFIGS)
 
@@ -52,6 +54,8 @@ def build_and_test(config, test_module, test_dir, extra_pythonpath=(), env=None)
     os.environ["PYTHONPATH"] = os.pathsep.join(paths + [os.environ.get("PYTHONPATH", "")])
     for k, v in (env or {}).items():
         os.environ[k] = v
+    # The harness serves memory with one cycle of read latency for SYNC_MEM cores.
+    os.environ["VORTEX_SYNC_MEM"] = str(parameters.get("SYNC_MEM", 0))
 
     runner = get_runner(os.getenv("SIM", "icarus"))
     runner.build(sources=rtl_sources(), hdl_toplevel=toplevel, build_dir=str(build_dir),

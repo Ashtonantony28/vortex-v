@@ -3,6 +3,8 @@
 Any core with the docs/M1-INTERFACE-v1.md ports (vortex_core, and later
 vortex_ooo_core) can be driven by these helpers.
 """
+import os
+
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, Timer
@@ -52,6 +54,9 @@ def _load_program(words, base=RESET_PC, data=None):
 
 async def _mem_model(dut, mem, state):
     """Serve imem combinationally and handle the dmem port each cycle."""
+    if os.environ.get("VORTEX_SYNC_MEM") == "1":
+        await _mem_model_sync(dut, mem, state)
+        return
     dual_fetch = hasattr(dut, "imem_addr1")
     while not state["stop"]:
         await Timer(1, units="ns")                 # let pc / comb settle
@@ -73,6 +78,44 @@ async def _mem_model(dut, mem, state):
             else:
                 dut.dmem_rdata.value = _rd_bytes(mem, daddr, nbytes)
         await RisingEdge(dut.clk)
+
+
+async def _mem_model_sync(dut, mem, state):
+    """Block-RAM-style memory (ADR 0012): every read returns one cycle after its
+    address. The address and request are sampled just after the falling edge,
+    once the core's combinational outputs have settled; the data is driven just
+    after the next rising edge. Writes take effect at the sample point. In reset
+    the core fetches RESET_PC, so that word is on the bus when reset is released."""
+    dual_fetch = hasattr(dut, "imem_addr1")
+    dut.imem_rdata.value = _rd_word(mem, RESET_PC)
+    if dual_fetch:
+        dut.imem_rdata1.value = _rd_word(mem, RESET_PC + 4)
+    while not state["stop"]:
+        await FallingEdge(dut.clk)
+        await Timer(1, units="ns")
+        iaddr = _safe_int(dut.imem_addr, RESET_PC)
+        cur = {"i0": _rd_word(mem, iaddr)}
+        if dual_fetch:
+            cur["i1"] = _rd_word(mem, _safe_int(dut.imem_addr1, RESET_PC + 4))
+        if _safe_int(dut.rst_n, 0) == 1 and _safe_int(dut.dmem_req, 0) == 1:
+            daddr = _safe_int(dut.dmem_addr, 0)
+            nbytes = 1 << _safe_int(dut.dmem_size, 0)
+            if _safe_int(dut.dmem_we, 0) == 1:
+                data = _safe_int(dut.dmem_wdata, 0)
+                _wr_bytes(mem, daddr, nbytes, data)
+                if daddr == TOHOST_ADDR:
+                    state["tohost"] = data & MASK64
+                    state["halt"] = True
+            else:
+                cur["d"] = _rd_bytes(mem, daddr, nbytes)
+        nxt = cur
+        await RisingEdge(dut.clk)
+        await Timer(1, units="ns")
+        dut.imem_rdata.value = nxt["i0"]
+        if dual_fetch:
+            dut.imem_rdata1.value = nxt["i1"]
+        if "d" in nxt:
+            dut.dmem_rdata.value = nxt["d"]
 
 
 async def run_program(dut, words, max_cycles=2000, debug=False, data=None):

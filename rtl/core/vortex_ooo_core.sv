@@ -48,8 +48,10 @@ module vortex_ooo_core
   parameter int unsigned      LSQ         = 0,   // 1 = loads pass older stores (ADR 0009)
   parameter int unsigned      XM_LATENCY  = 1,   // Xmlacc cycles: 1 = single-cycle port,
                                                  // 2..8 = pipelined unit, own port (ADR 0010)
-  parameter logic [XLEN-1:0]  IO_LIMIT    = 64'h8000_0000  // LSQ: loads below this are device
+  parameter logic [XLEN-1:0]  IO_LIMIT    = 64'h8000_0000, // LSQ: loads below this are device
                                                  // loads, run only from the queue head (ADR 0011)
+  parameter int unsigned      SYNC_MEM    = 0    // 1 = memories answer one cycle after the
+                                                 // address, as block RAM does (ADR 0012)
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -103,6 +105,7 @@ module vortex_ooo_core
   localparam bit          XMP       = (XM_LATENCY > 1);              // pipelined Xmlacc
   localparam int unsigned XS        = XMP ? (XM_LATENCY - 1) : 1;    // its register stages
   localparam int unsigned XM_LANES  = XLEN / 8;                      // int8 MACs per op
+  localparam bit          SYNC      = (SYNC_MEM != 0);
 
   // Parameter checks (ADR 0006 item 8). Evaluated at time zero in simulation and
   // by lint; a bad configuration stops the run before any instruction executes.
@@ -215,12 +218,19 @@ module vortex_ooo_core
   // ---------------------------------------------------------------------------
   // Fetch + decode
   // ---------------------------------------------------------------------------
+  // pc is the instruction being decoded; pc_n is the pc for the next cycle
+  // (computed with the sequential logic below). With SYNC_MEM the memory
+  // registers the address, so it is given pc_n and returns pc's instruction a
+  // cycle later, with no bubble (ADR 0012). During reset it fetches RESET_PC.
+  logic [XLEN-1:0] pc_n, pc1;
+  assign pc1 = pc + INST_BYTES;
+
   logic [31:0] inst;
-  assign imem_addr = pc;
+  assign imem_addr = !SYNC ? pc : (!rst_n ? RESET_PC : pc_n);
   assign inst      = imem_rdata;
 
   logic [31:0] inst1;
-  assign imem_addr1 = pc + INST_BYTES;
+  assign imem_addr1 = imem_addr + INST_BYTES;
   assign inst1      = imem_rdata1;
 
   logic [4:0]       rs1_addr, rs2_addr, rs3_addr, rd_addr;
@@ -359,7 +369,7 @@ module vortex_ooo_core
   assign d_spec0 = SPEC && is_branch;
   assign d_spec1 = SPEC && is_branch1;
   assign pred0   = bht[pc[BW+1:2]][1];
-  assign pred1   = bht[imem_addr1[BW+1:2]][1];
+  assign pred1   = bht[pc1[BW+1:2]][1];
 
   // ---------------------------------------------------------------------------
   // Rename
@@ -757,11 +767,34 @@ module vortex_ooo_core
   assign dmem_size  = st_fire ? mq_size[mq_head] : mq_size[lx_idx];
   assign dmem_wdata = mq_data[mq_head];
 
+  // Load writeback. Without SYNC_MEM it happens in the cycle the load runs.
+  // With SYNC_MEM the memory answers a cycle later, so the load's tags (and a
+  // forwarded value) wait one cycle in lw_* and write back then (ADR 0012).
+  logic            lw_valid, lw_has_rd, lw_uns, lw_hit;
+  logic [1:0]      lw_size;
+  logic [PW-1:0]   lw_dst;
+  logic [RW-1:0]   lw_rob;
+  logic [XLEN-1:0] lw_fdata;
+
+  logic            wb_fire, wb_has_rd, wb_uns, wb_hit;
+  logic [1:0]      wb_size;
+  logic [PW-1:0]   wb_dst;
+  logic [RW-1:0]   wb_rob;
+  logic [XLEN-1:0] wb_fdata;
+  assign wb_fire   = SYNC ? lw_valid  : lx_fire;
+  assign wb_has_rd = SYNC ? lw_has_rd : mq_has_rd[lx_idx];
+  assign wb_uns    = SYNC ? lw_uns    : mq_uns[lx_idx];
+  assign wb_hit    = SYNC ? lw_hit    : lx_hit;
+  assign wb_size   = SYNC ? lw_size   : mq_size[lx_idx];
+  assign wb_dst    = SYNC ? lw_dst    : mq_dst[lx_idx];
+  assign wb_rob    = SYNC ? lw_rob    : mq_rob[lx_idx];
+  assign wb_fdata  = SYNC ? lw_fdata  : f_data[lq_off];
+
   logic [XLEN-1:0] ld_data;
   vortex_load_ext #(.XLEN(XLEN)) u_load_ext (
-    .size        (mq_size[lx_idx]),
-    .is_unsigned (mq_uns[lx_idx]),
-    .raw         (lx_hit ? f_data[lq_off] : dmem_rdata),
+    .size        (wb_size),
+    .is_unsigned (wb_uns),
+    .raw         (wb_hit ? wb_fdata : dmem_rdata),
     .data        (ld_data)
   );
 
@@ -814,6 +847,32 @@ module vortex_ooo_core
   logic [1:0] ooo_events;
   assign ooo_events = 2'(sc_fire && older_incomplete_sc) + 2'(mul_done && older_incomplete_mul)
                     + 2'(issue1 && older_incomplete_p1);
+
+  // ---------------------------------------------------------------------------
+  // Next pc. Later sources win: dispatch (sequential or predicted), then a
+  // resolving branch/JALR on either port, then a mispredict squash.
+  // ---------------------------------------------------------------------------
+  always_comb begin
+    pc_n = pc;
+    if (dispatch) begin
+      if (is_jal || (d_spec0 && pred0))      pc_n = pc + imm;
+      else if (!dispatch1)                   pc_n = pc1;
+      else if (is_jal1 || (d_spec1 && pred1)) pc_n = pc1 + imm1;
+      else                                   pc_n = pc1 + INST_BYTES;
+    end
+    // Fall-through pc + 4 was set at dispatch; only a taken branch or JALR moves it.
+    if (redirect) begin
+      if (iq_jalr[s_idx])  pc_n = jalr_target;
+      else if (br_taken)   pc_n = br_target;
+    end
+    // At most one branch/JALR is ever in flight, so redirect and redirect1
+    // never fire together.
+    if (redirect1) begin
+      if (iq_jalr[s1_idx]) pc_n = (p1_op1 + p1_imm) & ~XLEN'(1);
+      else if (p1_taken)   pc_n = p1_pc + p1_imm;
+    end
+    if (squash) pc_n = squash_pc;
+  end
 
   // ---------------------------------------------------------------------------
   // Sequential state
@@ -909,6 +968,14 @@ module vortex_ooo_core
       dbg_lsq_forwards    <= '0;
       dbg_lsq_early       <= '0;
       dbg_xm_macs         <= '0;
+      lw_valid            <= 1'b0;
+      lw_has_rd           <= 1'b0;
+      lw_uns              <= 1'b0;
+      lw_hit              <= 1'b0;
+      lw_size             <= '0;
+      lw_dst              <= '0;
+      lw_rob              <= '0;
+      lw_fdata            <= '0;
       for (int k = 0; k < XS; k++) xp_valid[k] <= 1'b0;
       spec_active         <= 1'b0;
       br_rob              <= '0;
@@ -924,15 +991,7 @@ module vortex_ooo_core
     end else begin
       // ---- Dispatch: rename, allocate ROB / IQ / memory-queue entries ----
       if (dispatch) begin
-        if (is_jal || (d_spec0 && pred0)) begin
-          pc <= pc + imm;
-        end else if (!dispatch1) begin
-          pc <= pc + INST_BYTES;
-        end else if (is_jal1 || (d_spec1 && pred1)) begin
-          pc <= imem_addr1 + imm1;
-        end else begin
-          pc <= imem_addr1 + INST_BYTES;
-        end
+        pc <= pc_n;
         if (d_ctrl_wait || (dispatch1 && d_ctrl_wait1)) fe_wait <= 1'b1;
 
         if (d_has_rd) begin
@@ -996,7 +1055,7 @@ module vortex_ooo_core
           preg_ready[d_newp1] <= 1'b0;
         end
 
-        rob_pc[rob_tail1]       <= imem_addr1;
+        rob_pc[rob_tail1]       <= pc1;
         rob_rd[rob_tail1]       <= rd_addr1;
         rob_has_rd[rob_tail1]   <= d_has_rd1;
         rob_newp[rob_tail1]     <= d_newp1;
@@ -1010,7 +1069,7 @@ module vortex_ooo_core
         iq_fu[iq_free_idx2]      <= d_fu1;
         iq_rob[iq_free_idx2]     <= rob_tail1;
         iq_memq[iq_free_idx2]    <= mq_tail1;
-        iq_pc[iq_free_idx2]      <= imem_addr1;
+        iq_pc[iq_free_idx2]      <= pc1;
         iq_imm[iq_free_idx2]     <= imm1;
         iq_src1[iq_free_idx2]    <= d_src1_1;
         iq_src2[iq_free_idx2]    <= d_src2_1;
@@ -1055,12 +1114,7 @@ module vortex_ooo_core
         rob_sat[iq_rob[s_idx]]      <= sc_sat;
       end
       if (redirect) begin
-        // Fall-through pc + 4 was set at dispatch; only a taken branch or JALR moves it.
-        if (iq_jalr[s_idx]) begin
-          pc <= jalr_target;
-        end else if (br_taken) begin
-          pc <= br_target;
-        end
+        pc      <= pc_n;
         fe_wait <= 1'b0;
       end
       if (issue1) begin
@@ -1073,13 +1127,7 @@ module vortex_ooo_core
         rob_sat[iq_rob[s1_idx]]      <= 1'b0;
       end
       if (redirect1) begin
-        // At most one branch/JALR is ever in flight, so redirect and redirect1
-        // never fire together.
-        if (iq_jalr[s1_idx]) begin
-          pc <= (p1_op1 + p1_imm) & ~XLEN'(1);
-        end else if (p1_taken) begin
-          pc <= p1_pc + p1_imm;
-        end
+        pc      <= pc_n;
         fe_wait <= 1'b0;
       end
       if (issue && (i_fu == FU_AGU)) begin
@@ -1146,12 +1194,25 @@ module vortex_ooo_core
         end
         rob_complete[div_rob] <= 1'b1;
       end
-      if (lx_fire) begin
-        if (mq_has_rd[lx_idx]) begin
-          prf[mq_dst[lx_idx]]        <= ld_data;
-          preg_ready[mq_dst[lx_idx]] <= 1'b1;
+      if (wb_fire) begin
+        if (wb_has_rd) begin
+          prf[wb_dst]        <= ld_data;
+          preg_ready[wb_dst] <= 1'b1;
         end
-        rob_complete[mq_rob[lx_idx]] <= 1'b1;
+        rob_complete[wb_rob] <= 1'b1;
+      end
+      // SYNC_MEM: hold the load's tags for next cycle's writeback. A load that a
+      // squash this cycle makes dead is dropped: its ROB entry and destination
+      // may be handed out again next cycle.
+      lw_valid  <= SYNC && lx_fire && !(squash && ((mq_rob[lx_idx] - rob_head) > br_age));
+      lw_has_rd <= mq_has_rd[lx_idx];
+      lw_uns    <= mq_uns[lx_idx];
+      lw_hit    <= lx_hit;
+      lw_size   <= mq_size[lx_idx];
+      lw_dst    <= mq_dst[lx_idx];
+      lw_rob    <= mq_rob[lx_idx];
+      lw_fdata  <= f_data[lq_off];
+      if (lx_fire) begin
         mq_done[lx_idx]              <= 1'b1;
         if (lx_hit) dbg_lsq_forwards <= dbg_lsq_forwards + DBG_CNT_W'(1);
         if (lx_idx != mq_head) dbg_lsq_early <= dbg_lsq_early + DBG_CNT_W'(1);
@@ -1250,7 +1311,7 @@ module vortex_ooo_core
       // back to the free list and are re-marked not-ready when reallocated.
       if (squash) begin
         dbg_mispredicts <= dbg_mispredicts + DBG_CNT_W'(1);
-        pc      <= squash_pc;
+        pc      <= pc_n;
         fe_wait <= 1'b0;   // any JALR waiting now is younger than the branch
         for (int r = 0; r < NARCH; r++) spec_rat[r] <= ckpt_rat[r];
         fl_head   <= ckpt_fl_head;
