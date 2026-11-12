@@ -22,6 +22,8 @@ POOL = list(range(1, 28))
 R_SCRATCH, R_LOOP, R_BASE, R_TOHOST = 28, 29, 30, 31
 MEM_SPAN = 2048          # load/store offsets stay within a 12-bit signed immediate
 assert MEM_SPAN <= DATA_SIZE
+ALIAS_P = 0.4            # chance a load/store reuses a recent store's doubleword
+RECENT_STORES = 4
 MAX_WORDS = (CODE_LIMIT - RESET_PC) // 4
 
 ALU_RR = ["add", "sub", "sll", "slt", "sltu", "xor_", "srl", "sra", "or_", "and_",
@@ -66,6 +68,7 @@ class RandomProgram:
         self.mix = dict(mix or DEFAULT_MIX)
         self.stats = Counter()
         self._label_n = 0
+        self._recent_st = []      # offsets of the last few stores, for aliasing
 
     # -- helpers ---------------------------------------------------------
     def _label(self):
@@ -84,6 +87,19 @@ class RandomProgram:
         if r < 0.2:
             return self.rng.choice([0, 1, -1, 2047, -2048])
         return self.rng.randint(-2048, 2047)
+
+    def _mem_off(self, size, is_store):
+        """Offset for a load/store. Often lands in the same doubleword as a
+        recent store, so loads forward (fully or partially) and stores overlap."""
+        rng = self.rng
+        if self._recent_st and rng.random() < ALIAS_P:
+            off = (rng.choice(self._recent_st) & ~7) + rng.randrange(0, 8, size)
+            self.stats["mem_alias"] += 1
+        else:
+            off = rng.randrange(0, MEM_SPAN - 8 + 1, size)
+        if is_store:
+            self._recent_st = (self._recent_st + [off])[-RECENT_STORES:]
+        return off
 
     # -- emitters for one "simple" instruction (no control flow) ----------
     def _emit_simple(self, a, allow_mem=True):
@@ -122,11 +138,11 @@ class RandomProgram:
                 getattr(a, op)(self._dst(), self._src(), self._src())
         elif kind == "load":
             op, size = rng.choice(list(LOADS.items()))
-            off = rng.randrange(0, MEM_SPAN - 8 + 1, size)
+            off = self._mem_off(size, is_store=False)
             getattr(a, op)(self._dst(), R_BASE, off)
         else:  # store
             op, size = rng.choice(list(STORES.items()))
-            off = rng.randrange(0, MEM_SPAN - 8 + 1, size)
+            off = self._mem_off(size, is_store=True)
             getattr(a, op)(self._src(), R_BASE, off)
 
     # -- control-flow items -----------------------------------------------

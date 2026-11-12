@@ -6,7 +6,9 @@ name: CI
 #               RV64I/RV64M conformance suite (on both the ISS and the RTL).
 #   2. lint   - verilator --lint-only -Wall over rtl/core/files.f, for both
 #               tops (vortex_core, and vortex_ooo_core at WIDTH 1 and 2, and
-#               two-wide with SPEC_BRANCHES=1).
+#               two-wide with SPEC_BRANCHES=1, and that plus LSQ=1).
+#   The tests job also runs the yosys SAT proof of the LSQ forwarding unit
+#   (verif/formal, ADR 0009).
 
 # Push runs the suite only on main + tags; every other branch is covered by its
 # pull_request run, so feature branches are tested once, not twice.
@@ -30,10 +32,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install simulator (Icarus Verilog) and RISC-V cross-compiler
+      - name: Install simulator (Icarus Verilog), yosys and RISC-V cross-compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iverilog gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+          sudo apt-get install -y -qq iverilog yosys gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
 
       - name: Install Python dependencies
         run: |
@@ -61,3 +63,4 @@ jobs:
           verilator --lint-only -Wall --top-module vortex_ooo_core -f rtl/core/files.f
           verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -f rtl/core/files.f
           verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GSPEC_BRANCHES=1 -f rtl/core/files.f
+          verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GSPEC_BRANCHES=1 -GLSQ=1 -f rtl/core/files.f
