@@ -68,4 +68,6 @@ jobs:
           verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GSPEC_BRANCHES=1 -GLSQ=1 -GXM_LATENCY=3 -f rtl/core/files.f
           verilator --lint-only -Wall --top-module vortex_soc -GCORE_OOO=0 -f rtl/core/files.f -f rtl/soc/files.f
           verilator --lint-only -Wall --top-module vortex_soc -f rtl/core/files.f -f rtl/soc/files.f
+          verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GSPEC_BRANCHES=1 -GLSQ=1 -GXM_LATENCY=3 -GSYNC_MEM=1 -f rtl/core/files.f
+          verilator --lint-only -Wall --top-module vortex_soc -GSYNC_MEM=1 -f rtl/core/files.f -f rtl/soc/files.f
           verilator --lint-only -Wall --top-module arty_a7_top -f rtl/core/files.f -f rtl/soc/files.f -f rtl/fpga/files.f

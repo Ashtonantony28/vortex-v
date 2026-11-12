@@ -76,9 +76,11 @@ correctness failures — the full suite is green — but they're real and owned.
   synthesis retiming. Whether that meets timing on the Arty A7 is unknown until M9.
 
 ## M9
-- **I18:** the SoC RAM reads combinationally (the M1 interface), so on the FPGA it maps to
-  distributed RAM, not block RAM. Block RAM needs a synchronous-read fetch and load path in the
-  cores (ADR 0011 follow-on).
+- **I18 (fixed for the OoO core, ADR 0012):** the SoC RAM read combinationally (the M1
+  interface), so on the FPGA it mapped to distributed RAM. `SYNC_MEM=1` gives `vortex_ooo_core`
+  a next-pc fetch and a one-cycle load stage, and the Arty top now builds block RAM. The in-order
+  core still needs combinational memory. Regression: `vortex_ooo_core_sync` in every suite, and
+  `soc_ooo_sync` in `verif/soc`.
 - **I19 (verification gap):** nothing has been synthesised yet. yosys 0.33 cannot parse the
   cores' `import pkg::*` headers, and Vivado is not available here. Utilisation, timing (the
   50 MHz target) and the pin constraints are unchecked until the first Vivado run.
