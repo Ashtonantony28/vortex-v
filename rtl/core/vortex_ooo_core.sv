@@ -44,7 +44,8 @@ module vortex_ooo_core
   parameter int unsigned      MEMQ_DEPTH  = 8,   // in-order memory queue (power of 2)
   parameter int unsigned      WIDTH       = 1,   // 1 = ADR 0006 scalar, 2 = ADR 0007 two-wide
   parameter int unsigned      SPEC_BRANCHES = 0, // unresolved predicted branches in flight (0/1)
-  parameter int unsigned      BHT_ENTRIES = 64   // 2-bit branch counters (power of 2)
+  parameter int unsigned      BHT_ENTRIES = 64,  // 2-bit branch counters (power of 2)
+  parameter int unsigned      LSQ         = 0    // 1 = loads pass older stores (ADR 0009)
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -94,6 +95,7 @@ module vortex_ooo_core
   localparam bit          DUAL      = (WIDTH == 2);
   localparam bit          SPEC      = (SPEC_BRANCHES != 0);
   localparam int unsigned BW        = $clog2(BHT_ENTRIES);
+  localparam bit          USE_LSQ   = (LSQ != 0);
 
   // Parameter checks (ADR 0006 item 8). Evaluated at time zero in simulation and
   // by lint; a bad configuration stops the run before any instruction executes.
@@ -145,6 +147,7 @@ module vortex_ooo_core
   logic            rob_complete [ROB_DEPTH];
   logic            rob_sat      [ROB_DEPTH];
   logic            rob_illegal  [ROB_DEPTH];
+  logic            rob_load     [ROB_DEPTH];   // LSQ: a load, popped from the memq at commit
   logic [RW-1:0]   rob_head, rob_tail;
   logic [RW:0]     rob_count;
 
@@ -183,6 +186,7 @@ module vortex_ooo_core
   logic            mq_uns   [MEMQ_DEPTH];
   logic [PW-1:0]   mq_dst   [MEMQ_DEPTH];
   logic            mq_has_rd[MEMQ_DEPTH];
+  logic            mq_done  [MEMQ_DEPTH];   // LSQ: load already executed
   logic [MW-1:0]   mq_head, mq_tail;
   logic [MW:0]     mq_count;
 
@@ -193,6 +197,9 @@ module vortex_ooo_core
   logic [DBG_CNT_W-1:0] dbg_dual_commits;
   // Debug: predicted branches resolved, and how many of them mispredicted.
   logic [DBG_CNT_W-1:0] dbg_spec_branches, dbg_mispredicts;
+  // Debug (LSQ): loads answered from a store, and loads executed behind an
+  // older memory operation still in the queue.
+  logic [DBG_CNT_W-1:0] dbg_lsq_forwards, dbg_lsq_early;
 
   // ---------------------------------------------------------------------------
   // Fetch + decode
@@ -645,17 +652,85 @@ module vortex_ooo_core
   assign st_fire = !halted && mq_nonempty &&  mq_store[mq_head] && mq_ready[mq_head]
                 && (rob_count != '0) && (mq_rob[mq_head] == rob_head);
 
-  assign dmem_req   = ld_fire || st_fire;
+  // ---------------------------------------------------------------------------
+  // LSQ (ADR 0009): any load in the queue may execute once every older store in
+  // the queue has its address. A load fully covered by the youngest overlapping
+  // older store takes its bytes from that store; a partial overlap waits for the
+  // store to commit. Stores still write only at commit. One load per cycle;
+  // a committing store has the data port first.
+  // ---------------------------------------------------------------------------
+  logic [MEMQ_DEPTH*XLEN-1:0] q_addr, q_data;
+  logic [MEMQ_DEPTH*2-1:0]    q_size;
+  logic [MEMQ_DEPTH-1:0]      q_store, q_known;
+  always_comb begin
+    logic [MW-1:0] idx;
+    for (int j = 0; j < MEMQ_DEPTH; j++) begin
+      idx = mq_head + MW'(j);
+      q_addr[j*XLEN +: XLEN] = mq_addr[idx];
+      q_data[j*XLEN +: XLEN] = mq_data[idx];
+      q_size[j*2 +: 2]       = mq_size[idx];
+      q_store[j]             = ((MW+1)'(j) < mq_count) && mq_store[idx];
+      q_known[j]             = mq_ready[idx];
+    end
+  end
+
+  logic [MEMQ_DEPTH-1:0] f_unknown, f_hit, f_partial;
+  logic [XLEN-1:0]       f_data [MEMQ_DEPTH];
+  for (genvar gi = 0; gi < MEMQ_DEPTH; gi++) begin : g_fwd
+    // The load at queue offset gi sees offsets 0..gi-1 as its older entries.
+    logic [MEMQ_DEPTH-1:0] older;
+    assign older = MEMQ_DEPTH'((1 << gi) - 1);
+    vortex_lsq_fwd #(.XLEN(XLEN), .N(MEMQ_DEPTH)) u_fwd (
+      .ld_addr  (q_addr[gi*XLEN +: XLEN]),
+      .ld_size  (q_size[gi*2 +: 2]),
+      .st_valid (q_store & older),
+      .st_known (q_known),
+      .st_addr  (q_addr),
+      .st_size  (q_size),
+      .st_data  (q_data),
+      .unknown  (f_unknown[gi]),
+      .hit      (f_hit[gi]),
+      .partial  (f_partial[gi]),
+      .data     (f_data[gi])
+    );
+  end
+
+  // Oldest load that can execute now
+  logic          lq_found;
+  logic [MW-1:0] lq_off;
+  always_comb begin
+    logic [MW-1:0] idx;
+    lq_found = 1'b0;
+    lq_off   = '0;
+    for (int i = MEMQ_DEPTH - 1; i >= 0; i--) begin
+      idx = mq_head + MW'(i);
+      if (((MW+1)'(i) < mq_count) && !mq_store[idx] && mq_ready[idx] && !mq_done[idx]
+          && !f_unknown[i] && !f_partial[i] && (f_hit[i] || !st_fire)) begin
+        lq_found = 1'b1;
+        lq_off   = MW'(i);
+      end
+    end
+  end
+
+  // Load execution, either mode: index, whether it forwards, and queue pop.
+  logic          lx_fire, lx_hit;
+  logic [1:0]    mq_pop;     // entries leaving the memory queue head this cycle
+  logic [MW-1:0] lx_idx;
+  assign lx_fire = USE_LSQ ? (!halted && lq_found) : ld_fire;
+  assign lx_idx  = USE_LSQ ? (mq_head + lq_off) : mq_head;
+  assign lx_hit  = USE_LSQ && f_hit[lq_off];
+
+  assign dmem_req   = st_fire || (lx_fire && !lx_hit);
   assign dmem_we    = st_fire;
-  assign dmem_addr  = mq_addr[mq_head];
-  assign dmem_size  = mq_size[mq_head];
+  assign dmem_addr  = st_fire ? mq_addr[mq_head] : mq_addr[lx_idx];
+  assign dmem_size  = st_fire ? mq_size[mq_head] : mq_size[lx_idx];
   assign dmem_wdata = mq_data[mq_head];
 
   logic [XLEN-1:0] ld_data;
   vortex_load_ext #(.XLEN(XLEN)) u_load_ext (
-    .size        (mq_size[mq_head]),
-    .is_unsigned (mq_uns[mq_head]),
-    .raw         (dmem_rdata),
+    .size        (mq_size[lx_idx]),
+    .is_unsigned (mq_uns[lx_idx]),
+    .raw         (lx_hit ? f_data[lq_off] : dmem_rdata),
     .data        (ld_data)
   );
 
@@ -678,6 +753,13 @@ module vortex_ooo_core
   assign commit1       = DUAL && commit && !tohost_commit && (rob_count >= (RW+1)'(2))
                       && rob_complete[rob_head1];
   assign commit_data1  = prf[rob_newp[rob_head1]];
+
+  // LSQ: a load stays in the queue until it commits, and leaves then (it is the
+  // queue head, or next after a store committing in slot 0). So every queue
+  // entry has a live ROB entry, which the squash age compare relies on (ADR 0009).
+  assign mq_pop  = USE_LSQ ? (2'(st_fire) + 2'(commit && rob_load[rob_head])
+                                          + 2'(commit1 && rob_load[rob_head1]))
+                           : 2'(st_fire || ld_fire);
 
   // Is any ROB entry older than the op completing now on the single-cycle port
   // (sc) or the multiplier port (mul) still incomplete? Feeds the debug counter.
@@ -732,6 +814,7 @@ module vortex_ooo_core
         rob_complete[e] <= 1'b0;
         rob_sat[e]      <= 1'b0;
         rob_illegal[e]  <= 1'b0;
+        rob_load[e]     <= 1'b0;
       end
       rob_head  <= '0;
       rob_tail  <= '0;
@@ -771,6 +854,7 @@ module vortex_ooo_core
         mq_uns[m]    <= 1'b0;
         mq_dst[m]    <= '0;
         mq_has_rd[m] <= 1'b0;
+        mq_done[m]   <= 1'b0;
       end
       mq_head  <= '0;
       mq_tail  <= '0;
@@ -791,6 +875,8 @@ module vortex_ooo_core
       dbg_dual_commits    <= '0;
       dbg_spec_branches   <= '0;
       dbg_mispredicts     <= '0;
+      dbg_lsq_forwards    <= '0;
+      dbg_lsq_early       <= '0;
       spec_active         <= 1'b0;
       br_rob              <= '0;
       ckpt_fl_head        <= '0;
@@ -830,6 +916,7 @@ module vortex_ooo_core
         rob_complete[rob_tail] <= 1'b0;
         rob_sat[rob_tail]      <= 1'b0;
         rob_illegal[rob_tail]  <= dec_illegal;
+        rob_load[rob_tail]     <= is_load;
         rob_tail               <= rob_tail + RW'(1) + RW'(dispatch1);
 
         iq_valid[iq_free_idx]   <= 1'b1;
@@ -860,6 +947,7 @@ module vortex_ooo_core
           mq_store[mq_tail]  <= is_store;
           mq_rob[mq_tail]    <= rob_tail;
           mq_ready[mq_tail]  <= 1'b0;
+          mq_done[mq_tail]   <= 1'b0;
           mq_size[mq_tail]   <= mem_size;
           mq_uns[mq_tail]    <= load_unsigned;
           mq_dst[mq_tail]    <= d_newp;
@@ -883,6 +971,7 @@ module vortex_ooo_core
         rob_complete[rob_tail1] <= 1'b0;
         rob_sat[rob_tail1]      <= 1'b0;
         rob_illegal[rob_tail1]  <= dec_illegal1;
+        rob_load[rob_tail1]     <= is_load1;
 
         iq_valid[iq_free_idx2]   <= 1'b1;
         iq_fu[iq_free_idx2]      <= d_fu1;
@@ -912,6 +1001,7 @@ module vortex_ooo_core
           mq_store[mq_tail1]  <= is_store1;
           mq_rob[mq_tail1]    <= rob_tail1;
           mq_ready[mq_tail1]  <= 1'b0;
+          mq_done[mq_tail1]   <= 1'b0;
           mq_size[mq_tail1]   <= mem_size1;
           mq_uns[mq_tail1]    <= load_unsigned1;
           mq_dst[mq_tail1]    <= d_newp1;
@@ -990,16 +1080,17 @@ module vortex_ooo_core
         end
         rob_complete[div_rob] <= 1'b1;
       end
-      if (ld_fire) begin
-        if (mq_has_rd[mq_head]) begin
-          prf[mq_dst[mq_head]]        <= ld_data;
-          preg_ready[mq_dst[mq_head]] <= 1'b1;
+      if (lx_fire) begin
+        if (mq_has_rd[lx_idx]) begin
+          prf[mq_dst[lx_idx]]        <= ld_data;
+          preg_ready[mq_dst[lx_idx]] <= 1'b1;
         end
-        rob_complete[mq_rob[mq_head]] <= 1'b1;
+        rob_complete[mq_rob[lx_idx]] <= 1'b1;
+        mq_done[lx_idx]              <= 1'b1;
+        if (lx_hit) dbg_lsq_forwards <= dbg_lsq_forwards + DBG_CNT_W'(1);
+        if (lx_idx != mq_head) dbg_lsq_early <= dbg_lsq_early + DBG_CNT_W'(1);
       end
-      if (ld_fire || st_fire) begin
-        mq_head <= mq_head + MW'(1);
-      end
+      mq_head <= mq_head + MW'(mq_pop);
 
       // ---- Commit ----
       if (commit) begin
@@ -1043,7 +1134,7 @@ module vortex_ooo_core
       rob_count <= rob_count + (RW+1)'(dispatch) + (RW+1)'(dispatch1)
                              - (RW+1)'(commit) - (RW+1)'(commit1);
       mq_count  <= mq_count + (MW+1)'(dispatch && d_is_mem) + (MW+1)'(dispatch1 && d_is_mem1)
-                            - (MW+1)'(ld_fire || st_fire);
+                            - (MW+1)'(mq_pop);
       fl_count  <= fl_count - (PW+1)'(dispatch && d_has_rd) - (PW+1)'(dispatch1 && d_has_rd1)
                             + (PW+1)'(commit && rob_has_rd[rob_head])
                             + (PW+1)'(commit1 && rob_has_rd[rob_head1]);
@@ -1108,11 +1199,11 @@ module vortex_ooo_core
         // Older entries are a prefix. If the head is younger it may be a load
         // firing now; then the queue empties behind it.
         if (mq_keep == '0) begin
-          mq_tail  <= mq_head + MW'(ld_fire || st_fire);
+          mq_tail  <= mq_head + MW'(mq_pop);
           mq_count <= '0;
         end else begin
           mq_tail  <= mq_head + MW'(mq_keep);
-          mq_count <= mq_keep - (MW+1)'(ld_fire || st_fire);
+          mq_count <= mq_keep - (MW+1)'(mq_pop);
         end
       end
     end

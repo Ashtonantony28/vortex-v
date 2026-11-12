@@ -22,6 +22,10 @@ A second program checks the two-wide configuration (ADR 0007): independent ALU
 ops must commit two per cycle (debug counter `dbg_dual_commits`) and finish in
 well under the in-order core's cycle count.
 
+A fifth program checks the load/store queue (ADR 0009): loads behind a store that
+is waiting to commit must run early, one must forward from the store, and the run
+must beat the in-order memory queue.
+
 Every run is also lockstep co-simulated against the ISS, so the speed-up is not
 bought with a wrong answer.
 
@@ -107,7 +111,39 @@ def loop_program():
     return a.assemble()
 
 
-PROGRAMS = {"overlap": overlap_program, "wide": wide_program, "loop": loop_program}
+N_LSQ_LOADS = 12       # independent loads behind a store that waits on a divide
+MAX_RATIO_LSQ = 0.95   # LSQ vs in-order-memory-queue cycles on that program
+                       # (measured at M7: 94 vs 105 cycles, 0.90)
+
+
+def lsq_program():
+    """A store sits behind a long divide in the ROB, so it cannot commit (and,
+    without the LSQ, nothing behind it in the memory queue can run). Its address
+    and data are known early. One load reads it back (forwarding); the others read
+    other addresses and, with the multiplies that use them, are free to run
+    during the divide (ADR 0009). 29 instructions are in flight behind the divide,
+    which fits the 32-entry ROB."""
+    a = Asm()
+    a.la(30, DATA_BASE)
+    a.addi(1, 0, 2000)
+    a.addi(2, 0, 7)
+    a.addi(5, 0, 123)
+    a.div(3, 1, 2)                       # ~65 cycles: holds the ROB head
+    a.sd(5, 30, 0)                       # address and data ready, waits to commit
+    a.ld(6, 30, 0)                       # fully covered: forwards 123
+    for i in range(N_LSQ_LOADS):
+        a.ld(7 + i, 30, 64 + 8 * i)      # no older store overlaps: runs early
+        a.mul(7 + i, 7 + i, 2)           # and so does the work that uses it
+    a.add(25, 6, 7)
+    a.add(25, 25, 3)                     # consumes the quotient
+    a.la(31, TOHOST_ADDR)
+    a.addi(26, 0, 1)
+    a.sw(26, 31, 0)
+    return a.assemble()
+
+
+PROGRAMS = {"overlap": overlap_program, "wide": wide_program, "loop": loop_program,
+            "lsq": lsq_program}
 
 try:
     import cocotb
@@ -125,7 +161,8 @@ if cocotb is not None:
                                                mem_check=(DATA_BASE, DATA_SIZE))
             res = {"cycles": state["cycles"]}
             for counter in ("dbg_ooo_completions", "dbg_dual_commits",
-                            "dbg_spec_branches", "dbg_mispredicts"):
+                            "dbg_spec_branches", "dbg_mispredicts",
+                            "dbg_lsq_forwards", "dbg_lsq_early"):
                 if hasattr(dut, counter):
                     res[counter] = int(getattr(dut, counter).value)
             dut._log.info("%s: %s", name, res)
@@ -179,3 +216,15 @@ def test_speculation_runs_ahead_of_branches(tmp_path):
     assert spec["cycles"] <= MAX_RATIO_SPEC * plain["cycles"], \
         f"speculative {spec['cycles']} cycles vs {plain['cycles']} without " \
         f"(need <= {MAX_RATIO_SPEC:.0%})"
+
+
+def test_lsq_runs_loads_past_a_waiting_store(tmp_path):
+    plain = _measure("vortex_ooo_core_spec", tmp_path)["lsq"]
+    lsq = _measure("vortex_ooo_core_lsq", tmp_path)["lsq"]
+    assert plain["dbg_lsq_forwards"] == 0 and plain["dbg_lsq_early"] == 0, \
+        "LSQ=0 must never forward or run a load early"
+    assert lsq["dbg_lsq_forwards"] >= 1, "the covered load did not forward"
+    assert lsq["dbg_lsq_early"] >= N_LSQ_LOADS // 2, \
+        f"only {lsq['dbg_lsq_early']} loads ran ahead of the queue head"
+    assert lsq["cycles"] <= MAX_RATIO_LSQ * plain["cycles"], \
+        f"LSQ {lsq['cycles']} cycles vs {plain['cycles']} without (need <= {MAX_RATIO_LSQ:.0%})"

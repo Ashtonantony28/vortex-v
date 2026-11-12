@@ -13,12 +13,14 @@ FILELIST = RTL_DIR / "files.f"
 
 # Each configuration is a name -> (HDL toplevel, parameters). The in-order reference
 # core, the M4 out-of-order core (ADR 0006), the same core two-wide (ADR 0007), and
-# two-wide with branch prediction and speculation (ADR 0008).
+# two-wide with branch prediction and speculation (ADR 0008), and that plus the
+# load/store queue with store-to-load forwarding (ADR 0009).
 CORE_CONFIGS = {
     "vortex_core": ("vortex_core", {}),
     "vortex_ooo_core": ("vortex_ooo_core", {}),
     "vortex_ooo_core_w2": ("vortex_ooo_core", {"WIDTH": 2}),
     "vortex_ooo_core_spec": ("vortex_ooo_core", {"WIDTH": 2, "SPEC_BRANCHES": 1}),
+    "vortex_ooo_core_lsq": ("vortex_ooo_core", {"WIDTH": 2, "SPEC_BRANCHES": 1, "LSQ": 1}),
 }
 CORES = tuple(CORE_CONFIGS)
 

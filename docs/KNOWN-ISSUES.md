@@ -55,3 +55,13 @@ correctness failures — the full suite is green — but they're real and owned.
 - **I12:** speculative loads read memory before older branches resolve. That is safe here,
   because the data memory has no side effects on reads. A future MMIO region with read side
   effects must hold its loads until they are non-speculative.
+
+## M7
+- **I13 (performance, by design for M7):** one load per cycle and one data-memory port, and a
+  load that only partly overlaps an older store waits for that store to commit (ADR 0009).
+  Loads stay in the memory queue until they commit, so `MEMQ_DEPTH` fills sooner than at M6.
+- **I14 (verification gap):** the forwarding proof runs at XLEN=32 with 3 older stores (yosys
+  SAT, since SymbiYosys is not installed). The core uses the same module at XLEN=64 with up to
+  7 older stores; that is covered by simulation only. ROB formal is not done.
+- **I15:** the L1 data cache named in the M7 roadmap row is deferred until a memory model with
+  latency exists (ADR 0009 item 6).

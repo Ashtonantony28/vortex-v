@@ -6,5 +6,6 @@ rtl/core/vortex_muldiv.sv
 rtl/core/vortex_xmlacc.sv
 rtl/core/vortex_branch_cmp.sv
 rtl/core/vortex_load_ext.sv
+rtl/core/vortex_lsq_fwd.sv
 rtl/core/vortex_core.sv
 rtl/core/vortex_ooo_core.sv
