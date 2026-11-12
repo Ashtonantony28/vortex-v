@@ -3,7 +3,7 @@
 A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML extension
 (**Xmlacc**), targeting a **Digilent Arty A7-100T** FPGA and running TinyML kernels.
 
-> **Status: M8 — two-wide speculative out-of-order RV64IM + Xmlacc core, in simulation.** Two
+> **Status: M9 (simulation side) — two-wide speculative out-of-order RV64IM + Xmlacc core in an SoC for the Arty A7, in simulation.** Two
 > cores live in `rtl/core/`: the in-order reference `vortex_core` and the out-of-order
 > `vortex_ooo_core` (register renaming, 32-entry ROB, issue queue, separate
 > multiplier/divider/Xmlacc units; ADR 0006). Its `WIDTH` parameter selects 1-wide or 2-wide
@@ -11,12 +11,13 @@ A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML exten
 > with speculative execution and checkpoint recovery (ADR 0008). `LSQ=1` lets loads run out of
 > order past older stores, with store-to-load forwarding (ADR 0009; the forwarding unit is proven
 > with yosys). `XM_LATENCY` makes the Xmlacc unit a pipelined functional unit with its own
-> writeback port (ADR 0010). All six configurations run
+> writeback port (ADR 0010). `vortex_soc` wraps a core with RAM, a UART and LEDs for the Arty A7,
+> and runs gcc-built C programs from `sw/` (ADR 0011). All six core configurations run
 > under Icarus via cocotb and are checked
 > instruction-by-instruction against a Python ISS golden model (`model/iss/`), on directed tests,
 > the riscv-tests rv64ui + rv64um suites (65 tests), and seeded constrained-random programs. Not
-> built yet: the L1 data cache, the C extension, CSRs/traps, `riscv-arch-test`, Spike, FPGA
-> bitstream, and benchmarks.
+> built yet: the L1 data cache, the C extension, CSRs/traps, `riscv-arch-test`, Spike, the FPGA
+> bitstream (Vivado not yet run), and benchmarks.
 > Every claim here is backed by a `Verify` command in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What this is
@@ -58,8 +59,12 @@ vortex-v/
 │   ├── KNOWN-ISSUES.md       # open and fixed issues, with regression tests
 │   ├── XMLACC-SPEC-v1.md     # the frozen Xmlacc ISA spec
 │   ├── M1-INTERFACE-v1.md    # core port / retire contract shared by every core
-│   └── adr/                  # architecture decision records 0001-0006
+│   └── adr/                  # architecture decision records 0001-0011
 ├── rtl/core/                 # in-order + out-of-order RV64IM + Xmlacc cores; files.f is the filelist
+├── rtl/soc/                  # vortex_soc: core + RAM + UART + LEDs (ADR 0011)
+├── rtl/fpga/                 # vendor wrappers (RAM, clock) and the Arty A7 top
+├── fpga/                     # Arty A7 pin constraints and Vivado build script
+├── sw/                       # bare-metal C runtime and programs for the SoC
 ├── isa/                      # Xmlacc opcode table + encoding tests
 ├── model/                    # numpy golden model for ML ops; model/iss = RV64IM+Xmlacc ISS
 ├── asm/                      # Xmlacc assembler / .insn helpers
@@ -68,7 +73,10 @@ vortex-v/
 └── verif/
     ├── core/                 # directed cocotb tests + lockstep co-sim; rvasm, harness, cores
     ├── conformance/          # riscv-tests on the ISS and on every core
-    └── crv/                  # seeded constrained-random programs, co-simmed vs the ISS
+    ├── crv/                  # seeded constrained-random programs, co-simmed vs the ISS
+    ├── formal/               # yosys SAT proof of the LSQ forwarding unit
+    ├── workloads/            # NeuroFlight int8 policy, bit-exact on every core
+    └── soc/                  # gcc-built C program on the SoC, checked over the UART
 ```
 
 `rtl/core/files.f` is the RTL filelist shared by lint and simulation.

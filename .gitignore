@@ -28,6 +28,7 @@ verilator.log
 sim_build/
 # cocotb outputs
 results.xml
+*.result.xml
 dump.fst
 dump.vcd
 
@@ -85,3 +86,6 @@ logs/
 *~
 .DS_Store
 Thumbs.db
+
+# ---- FPGA build outputs ----
+fpga/out/

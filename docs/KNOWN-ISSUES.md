@@ -74,3 +74,13 @@ correctness failures — the full suite is green — but they're real and owned.
   the fix (ADR 0010 follow-on).
 - **I17:** the pipelined Xmlacc stages (`XM_LATENCY` > 1) are output registers that rely on
   synthesis retiming. Whether that meets timing on the Arty A7 is unknown until M9.
+
+## M9
+- **I18:** the SoC RAM reads combinationally (the M1 interface), so on the FPGA it maps to
+  distributed RAM, not block RAM. Block RAM needs a synchronous-read fetch and load path in the
+  cores (ADR 0011 follow-on).
+- **I19 (verification gap):** nothing has been synthesised yet. yosys 0.33 cannot parse the
+  cores' `import pkg::*` headers, and Vivado is not available here. Utilisation, timing (the
+  50 MHz target) and the pin constraints are unchecked until the first Vivado run.
+- **I20:** the UART has no receiver, and device reads must have no side effects: with
+  `SPEC_BRANCHES=1` a device load at the memory-queue head can still be on a wrong path.
