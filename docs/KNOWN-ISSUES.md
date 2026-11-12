@@ -38,3 +38,11 @@ correctness failures — the full suite is green — but they're real and owned.
 - **I8 (verification gap):** `dbg_ooo_completions` counts only single-cycle and multiplier
   completions; divider and load completions ahead of older work are not counted. It is a proof
   aid, not a performance counter.
+
+## M5
+- **I9 (performance, by design for M5):** on the constrained-random mix the two-wide core is only
+  about 7% faster than one-wide (500-seed soak: 4.28 ms vs 4.58 ms simulated). Branches stop
+  dispatch until they resolve and memory goes one access per cycle, so groups of two rarely form.
+  Independent straight-line code reaches 2 per cycle. M6 (speculation) and M7 (LSQ) are the fix.
+- **I10:** issue port 1 is ALU/branch only (ADR 0007 item 5), so two multiplies, two loads or two
+  Xmlacc ops never issue in the same cycle.

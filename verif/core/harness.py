@@ -52,10 +52,13 @@ def _load_program(words, base=RESET_PC, data=None):
 
 async def _mem_model(dut, mem, state):
     """Serve imem combinationally and handle the dmem port each cycle."""
+    dual_fetch = hasattr(dut, "imem_addr1")
     while not state["stop"]:
         await Timer(1, units="ns")                 # let pc / comb settle
         iaddr = _safe_int(dut.imem_addr, RESET_PC)
         dut.imem_rdata.value = _rd_word(mem, iaddr)
+        if dual_fetch:                             # M1-INTERFACE v1.1 second fetch port
+            dut.imem_rdata1.value = _rd_word(mem, _safe_int(dut.imem_addr1, RESET_PC + 4))
         await Timer(1, units="ns")                 # let decode -> dmem_addr settle
         if _safe_int(dut.rst_n, 0) == 1 and _safe_int(dut.dmem_req, 0) == 1:
             daddr = _safe_int(dut.dmem_addr, 0)
@@ -90,6 +93,9 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
     dut.rst_n.value = 0
     dut.imem_rdata.value = 0
     dut.dmem_rdata.value = 0
+    two_slots = hasattr(dut, "dbg1_retire_valid")    # M1-INTERFACE v1.1 second retire slot
+    if two_slots:
+        dut.imem_rdata1.value = 0
     for _ in range(3):
         await RisingEdge(dut.clk)                  # reset branch sets pc <- RESET_PC
 
@@ -111,10 +117,19 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
                 "rd":   _safe_int(dut.dbg_wb_rd, 0),
                 "data": _safe_int(dut.dbg_wb_data, 0) & MASK64,
             })
+        rv1 = _safe_int(dut.dbg1_retire_valid, 0) if two_slots else 0
+        if rv1 == 1:                                # slot 1 is younger than slot 0
+            assert rv == 1, "dbg1_retire_valid without dbg_retire_valid"
+            retires.append({
+                "pc":   _safe_int(dut.dbg1_retire_pc, 0) & MASK64,
+                "wbv":  _safe_int(dut.dbg1_wb_valid, 0),
+                "rd":   _safe_int(dut.dbg1_wb_rd, 0),
+                "data": _safe_int(dut.dbg1_wb_data, 0) & MASK64,
+            })
         if debug and rv == 1:
-            r = retires[-1]
-            dut._log.info("retire pc=%016x wbv=%d rd=%d data=%016x",
-                          r["pc"], r["wbv"], r["rd"], r["data"])
+            for r in retires[-(1 + rv1):]:
+                dut._log.info("retire pc=%016x wbv=%d rd=%d data=%016x",
+                              r["pc"], r["wbv"], r["rd"], r["data"])
         state["mlstat_sat"] = _safe_int(dut.dbg_mlstat_sat, 0)
         if state["halt"] and rv == 0 and len(retires) > 0:
             break
@@ -177,6 +192,8 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
     assert state["tohost"] == 1, f"{name}: RTL tohost={state['tohost']} (expected PASS=1)"
 
     for i, rtl_rec in enumerate(retires):
+        assert not iss.halted, \
+            f"{name}[{i}]: RTL retired pc={rtl_rec['pc']:#x} after the tohost store"
         rec = iss.step()
         iss_pc = rec["pc"] & MASK64
         iss_rd = rec.get("rd")

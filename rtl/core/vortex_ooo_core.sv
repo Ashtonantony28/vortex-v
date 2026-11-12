@@ -1,8 +1,13 @@
 // vortex_ooo_core.sv — Vortex-V M4 out-of-order RV64IM + Xmlacc core (top level).
 //
-// Implements ADR 0006. Same ports and retire contract as vortex_core
-// (docs/M1-INTERFACE-v1.md), so every suite that checks the in-order core checks
-// this one unchanged.
+// Implements ADR 0006 (M4) and, with WIDTH=2, ADR 0007 (M5 two-wide). It has the
+// vortex_core ports (docs/M1-INTERFACE-v1.md) plus the additive v1.1 ports: a
+// second fetch port (imem_addr1 = pc + 4) and a second retire slot (dbg1_*).
+// Every suite that checks the in-order core checks this one at both widths.
+//
+// WIDTH=2: up to 2 instructions dispatch, issue and commit per cycle. Slot 1
+// dispatches behind a non-control-flow slot 0 and renames against it; issue
+// port 1 is ALU/branch only; commit slot 1 takes the next complete ROB entry.
 //
 //   fetch/decode/rename/dispatch (1 per cycle)
 //     -> ROB (in order) + unified age-ordered issue queue + in-order memory queue
@@ -33,7 +38,8 @@ module vortex_ooo_core
   parameter int unsigned      NUM_PREGS   = 64,  // physical registers (power of 2)
   parameter int unsigned      ROB_DEPTH   = 32,  // reorder buffer entries (power of 2)
   parameter int unsigned      IQ_DEPTH    = 16,  // unified issue queue entries
-  parameter int unsigned      MEMQ_DEPTH  = 8    // in-order memory queue (power of 2)
+  parameter int unsigned      MEMQ_DEPTH  = 8,   // in-order memory queue (power of 2)
+  parameter int unsigned      WIDTH       = 1    // 1 = ADR 0006 scalar, 2 = ADR 0007 two-wide
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -41,6 +47,8 @@ module vortex_ooo_core
   // Instruction fetch
   output logic [XLEN-1:0]   imem_addr,
   input  logic [31:0]       imem_rdata,
+  output logic [XLEN-1:0]   imem_addr1,   // v1.1: second fetch port, always pc + 4
+  input  logic [31:0]       imem_rdata1,
 
   // Data memory
   output logic              dmem_req,
@@ -56,7 +64,14 @@ module vortex_ooo_core
   output logic              dbg_wb_valid,
   output logic [4:0]        dbg_wb_rd,
   output logic [XLEN-1:0]   dbg_wb_data,
-  output logic              dbg_mlstat_sat
+  output logic              dbg_mlstat_sat,
+
+  // v1.1: second retire slot (younger than slot 0 in the same cycle; WIDTH=2 only)
+  output logic              dbg1_retire_valid,
+  output logic [XLEN-1:0]   dbg1_retire_pc,
+  output logic              dbg1_wb_valid,
+  output logic [4:0]        dbg1_wb_rd,
+  output logic [XLEN-1:0]   dbg1_wb_data
 );
 
   // ---------------------------------------------------------------------------
@@ -71,6 +86,7 @@ module vortex_ooo_core
   localparam int unsigned NFREE0    = NUM_PREGS - NARCH;   // free pregs after reset
   localparam int unsigned DBG_CNT_W = 32;
   localparam logic [XLEN-1:0] INST_BYTES = XLEN'(4);
+  localparam bit          DUAL      = (WIDTH == 2);
 
   // Parameter checks (ADR 0006 item 8). Evaluated at time zero in simulation and
   // by lint; a bad configuration stops the run before any instruction executes.
@@ -80,6 +96,8 @@ module vortex_ooo_core
              NUM_PREGS, ROB_DEPTH);
     if ((1 << PW) != NUM_PREGS || (1 << RW) != ROB_DEPTH || (1 << MW) != MEMQ_DEPTH)
       $fatal(1, "vortex_ooo_core: NUM_PREGS, ROB_DEPTH and MEMQ_DEPTH must be powers of 2");
+    if (WIDTH < 1 || WIDTH > 2)
+      $fatal(1, "vortex_ooo_core: WIDTH must be 1 or 2 (ADR 0002), got %0d", WIDTH);
     if (IQ_DEPTH < 2 || IQ_DEPTH > ROB_DEPTH || MEMQ_DEPTH > ROB_DEPTH)
       $fatal(1, "vortex_ooo_core: need 2 <= IQ_DEPTH <= ROB_DEPTH and MEMQ_DEPTH <= ROB_DEPTH");
   end
@@ -152,6 +170,8 @@ module vortex_ooo_core
   // Debug: completions (single-cycle and multiplier ports) while an older ROB
   // entry was still incomplete. Nonzero proves out-of-order completion (ADR 0006 verification).
   logic [DBG_CNT_W-1:0] dbg_ooo_completions;
+  // Debug: cycles in which two instructions committed (WIDTH=2 proof aid).
+  logic [DBG_CNT_W-1:0] dbg_dual_commits;
 
   // ---------------------------------------------------------------------------
   // Fetch + decode
@@ -159,6 +179,10 @@ module vortex_ooo_core
   logic [31:0] inst;
   assign imem_addr = pc;
   assign inst      = imem_rdata;
+
+  logic [31:0] inst1;
+  assign imem_addr1 = pc + INST_BYTES;
+  assign inst1      = imem_rdata1;
 
   logic [4:0]       rs1_addr, rs2_addr, rs3_addr, rd_addr;
   logic             use_rs1, use_rs2, use_rs3;
@@ -211,29 +235,85 @@ module vortex_ooo_core
     .illegal       (dec_illegal)
   );
 
-  // Functional-unit class
-  fu_e d_fu;
-  always_comb begin
-    if (is_load || is_store) begin
-      d_fu = FU_AGU;
-    end else if (is_muldiv) begin
-      if ((md_op == MD_MUL) || (md_op == MD_MULH) || (md_op == MD_MULHSU)
-          || (md_op == MD_MULHU)) begin
-        d_fu = FU_MUL;
-      end else begin
-        d_fu = FU_DIV;
-      end
-    end else if (is_xmlacc) begin
-      d_fu = FU_XM;
-    end else begin
-      d_fu = FU_ALU;
+
+  // Slot 1 decoder (its outputs are ignored when WIDTH=1)
+  logic [4:0]       rs1_addr1, rs2_addr1, rs3_addr1, rd_addr1;
+  logic             use_rs1_1, use_rs2_1, use_rs3_1;
+  logic [XLEN-1:0]  imm1;
+  alu_op_e          alu_op1;
+  logic             alu_a_pc1, alu_b_imm1;
+  wb_src_e          wb_src1;
+  logic             reg_we1;
+  logic             is_load1, is_store1;
+  logic [1:0]       mem_size1;
+  logic             load_unsigned1;
+  logic             is_branch1;
+  logic [2:0]       branch_f3_1;
+  logic             is_jal1, is_jalr1;
+  logic             is_muldiv1;
+  md_op_e           md_op1;
+  logic             md_word1;
+  logic             is_xmlacc1;
+  xmlacc_op_e       xm_op1;
+  logic             dec_illegal1;
+
+  vortex_decoder #(.XLEN(XLEN)) u_decoder1 (
+    .inst          (inst1),
+    .rs1_addr      (rs1_addr1),
+    .rs2_addr      (rs2_addr1),
+    .rs3_addr      (rs3_addr1),
+    .rd_addr       (rd_addr1),
+    .use_rs1       (use_rs1_1),
+    .use_rs2       (use_rs2_1),
+    .use_rs3       (use_rs3_1),
+    .imm           (imm1),
+    .alu_op        (alu_op1),
+    .alu_a_pc      (alu_a_pc1),
+    .alu_b_imm     (alu_b_imm1),
+    .wb_src        (wb_src1),
+    .reg_we        (reg_we1),
+    .is_load       (is_load1),
+    .is_store      (is_store1),
+    .mem_size      (mem_size1),
+    .load_unsigned (load_unsigned1),
+    .is_branch     (is_branch1),
+    .branch_f3     (branch_f3_1),
+    .is_jal        (is_jal1),
+    .is_jalr       (is_jalr1),
+    .is_muldiv     (is_muldiv1),
+    .md_op         (md_op1),
+    .md_word       (md_word1),
+    .is_xmlacc     (is_xmlacc1),
+    .xm_op         (xm_op1),
+    .illegal       (dec_illegal1)
+  );
+
+  // Functional-unit class of a decoded instruction
+  function automatic fu_e fu_class(input logic ld_or_st, input logic md, input md_op_e mop,
+                                   input logic xm);
+    if (ld_or_st) return FU_AGU;
+    if (md) begin
+      if ((mop == MD_MUL) || (mop == MD_MULH) || (mop == MD_MULHSU) || (mop == MD_MULHU))
+        return FU_MUL;
+      return FU_DIV;
     end
-  end
+    if (xm) return FU_XM;
+    return FU_ALU;
+  endfunction
+
+  fu_e d_fu, d_fu1;
+  assign d_fu  = fu_class(is_load || is_store, is_muldiv, md_op, is_xmlacc);
+  assign d_fu1 = fu_class(is_load1 || is_store1, is_muldiv1, md_op1, is_xmlacc1);
 
   logic d_has_rd, d_is_mem, d_ctrl_wait;
   assign d_has_rd    = reg_we && (rd_addr != '0);
   assign d_is_mem    = is_load || is_store;
   assign d_ctrl_wait = is_branch || is_jalr;   // stop dispatch until it resolves
+
+  logic d_has_rd1, d_is_mem1, d_ctrl_wait1;
+  assign d_has_rd1    = reg_we1 && (rd_addr1 != '0);
+  assign d_is_mem1    = is_load1 || is_store1;
+  assign d_ctrl_wait1 = is_branch1 || is_jalr1;
 
   // ---------------------------------------------------------------------------
   // Rename
@@ -245,16 +325,36 @@ module vortex_ooo_core
   assign d_newp = d_has_rd ? fl_q[fl_head] : '0;
   assign d_oldp = spec_rat[rd_addr];
 
-  // First free issue-queue slot
-  logic          iq_has_free;
-  logic [QW-1:0] iq_free_idx;
+  // Slot 1 renames against slot 0 of the same group (ADR 0007 item 4).
+  logic [PW-1:0] d_src1_1, d_src2_1, d_src3_1, d_newp1, d_oldp1;
+  logic [PW-1:0] fl_head1;
+  assign d_src1_1 = !use_rs1_1 ? '0 : (d_has_rd && (rs1_addr1 == rd_addr)) ? d_newp
+                                    : spec_rat[rs1_addr1];
+  assign d_src2_1 = !use_rs2_1 ? '0 : (d_has_rd && (rs2_addr1 == rd_addr)) ? d_newp
+                                    : spec_rat[rs2_addr1];
+  assign d_src3_1 = !use_rs3_1 ? '0 : (d_has_rd && (rs3_addr1 == rd_addr)) ? d_newp
+                                    : spec_rat[rs3_addr1];
+  assign fl_head1 = fl_head + PW'(d_has_rd);
+  assign d_newp1  = d_has_rd1 ? fl_q[fl_head1] : '0;
+  assign d_oldp1  = (d_has_rd && (rd_addr1 == rd_addr)) ? d_newp : spec_rat[rd_addr1];
+
+  // First two free issue-queue slots
+  logic          iq_has_free, iq_has_free2;
+  logic [QW-1:0] iq_free_idx, iq_free_idx2;
   always_comb begin
-    iq_has_free = 1'b0;
-    iq_free_idx = '0;
-    for (int i = IQ_DEPTH - 1; i >= 0; i--) begin
+    iq_has_free  = 1'b0;
+    iq_has_free2 = 1'b0;
+    iq_free_idx  = '0;
+    iq_free_idx2 = '0;
+    for (int i = 0; i < IQ_DEPTH; i++) begin
       if (!iq_valid[i]) begin
-        iq_has_free = 1'b1;
-        iq_free_idx = QW'(i);
+        if (!iq_has_free) begin
+          iq_has_free = 1'b1;
+          iq_free_idx = QW'(i);
+        end else if (!iq_has_free2) begin
+          iq_has_free2 = 1'b1;
+          iq_free_idx2 = QW'(i);
+        end
       end
     end
   end
@@ -266,12 +366,52 @@ module vortex_ooo_core
                  && (!d_is_mem || (mq_count != (MW+1)'(MEMQ_DEPTH)))
                  && (!d_has_rd || (fl_count != '0));
 
+  // Slot 1 goes only behind a dispatching, non-control-flow slot 0, and only if
+  // there is room for both instructions.
+  logic [MW:0] mq_need;
+  logic [PW:0] fl_need;
+  assign mq_need = (MW+1)'(d_is_mem) + (MW+1)'(d_is_mem1);
+  assign fl_need = (PW+1)'(d_has_rd) + (PW+1)'(d_has_rd1);
+
+  logic [RW-1:0] rob_tail1;
+  logic [MW-1:0] mq_tail1;
+  assign rob_tail1 = rob_tail + RW'(1);
+  assign mq_tail1  = mq_tail + MW'(d_is_mem);
+
+  logic dispatch1;
+  assign dispatch1 = DUAL && dispatch && !(is_jal || d_ctrl_wait)
+                  && (rob_count <= (RW+1)'(ROB_DEPTH - 2))
+                  && iq_has_free2
+                  && ((mq_count + mq_need) <= (MW+1)'(MEMQ_DEPTH))
+                  && (fl_need <= fl_count);
+
   // ---------------------------------------------------------------------------
   // Issue select: oldest (by ROB age) valid entry whose sources are ready and
   // whose functional unit can accept it.
   // ---------------------------------------------------------------------------
   logic mul_busy, div_busy;
 
+  // Port 1 (WIDTH=2): oldest ready ALU/branch entry.
+  logic          issue1;
+  logic [QW-1:0] s1_idx;
+  always_comb begin
+    logic [RW-1:0] best_age, age;
+    issue1   = 1'b0;
+    s1_idx   = '0;
+    best_age = '0;
+    for (int i = 0; i < IQ_DEPTH; i++) begin
+      age = iq_rob[i] - rob_head;
+      if (DUAL && iq_valid[i] && (fu_e'(iq_fu[i]) == FU_ALU)
+          && preg_ready[iq_src1[i]] && preg_ready[iq_src2[i]]
+          && (!issue1 || (age < best_age))) begin
+        issue1   = 1'b1;
+        s1_idx   = QW'(i);
+        best_age = age;
+      end
+    end
+  end
+
+  // Port 0: oldest ready entry of any unit that port 1 did not take.
   logic          issue;
   logic [QW-1:0] s_idx;
   always_comb begin
@@ -287,7 +427,8 @@ module vortex_ooo_core
         default: fu_ok = 1'b1;
       endcase
       age = iq_rob[i] - rob_head;
-      if (iq_valid[i] && fu_ok && preg_ready[iq_src1[i]] && preg_ready[iq_src2[i]]
+      if (iq_valid[i] && fu_ok && !(issue1 && (QW'(i) == s1_idx))
+          && preg_ready[iq_src1[i]] && preg_ready[iq_src2[i]]
           && preg_ready[iq_src3[i]] && (!issue || (age < best_age))) begin
         issue    = 1'b1;
         s_idx    = QW'(i);
@@ -335,6 +476,36 @@ module vortex_ooo_core
 
   logic redirect;
   assign redirect = issue && (i_fu == FU_ALU) && (iq_branch[s_idx] || iq_jalr[s_idx]);
+
+  // ---------------------------------------------------------------------------
+  // Issue port 1: second ALU / branch unit (WIDTH=2)
+  // ---------------------------------------------------------------------------
+  logic [XLEN-1:0] p1_op1, p1_op2, p1_pc, p1_imm, p1_a, p1_b, p1_y, p1_res;
+  assign p1_op1 = prf[iq_src1[s1_idx]];
+  assign p1_op2 = prf[iq_src2[s1_idx]];
+  assign p1_pc  = iq_pc[s1_idx];
+  assign p1_imm = iq_imm[s1_idx];
+  assign p1_a   = iq_a_pc[s1_idx]  ? p1_pc  : p1_op1;
+  assign p1_b   = iq_b_imm[s1_idx] ? p1_imm : p1_op2;
+  assign p1_res = iq_link[s1_idx]  ? (p1_pc + INST_BYTES) : p1_y;
+
+  vortex_alu #(.XLEN(XLEN)) u_alu1 (
+    .op (alu_op_e'(iq_alu_op[s1_idx])),
+    .a  (p1_a),
+    .b  (p1_b),
+    .y  (p1_y)
+  );
+
+  logic p1_taken;
+  vortex_branch_cmp #(.XLEN(XLEN)) u_branch_cmp1 (
+    .f3    (iq_bf3[s1_idx]),
+    .a     (p1_op1),
+    .b     (p1_op2),
+    .taken (p1_taken)
+  );
+
+  logic redirect1;
+  assign redirect1 = issue1 && (iq_branch[s1_idx] || iq_jalr[s1_idx]);
 
   // ---------------------------------------------------------------------------
   // Xmlacc FU (combinational)
@@ -433,24 +604,39 @@ module vortex_ooo_core
   logic [XLEN-1:0] commit_data;
   assign commit_data = prf[rob_newp[rob_head]];
 
+  // Commit slot 1: the next entry, if complete, unless slot 0 is the tohost store.
+  // Stores never set rob_complete, so a store can only commit in slot 0.
+  logic [RW-1:0]   rob_head1;
+  logic            tohost_commit, commit1;
+  logic [XLEN-1:0] commit_data1;
+  assign rob_head1     = rob_head + RW'(1);
+  assign tohost_commit = st_fire && (mq_addr[mq_head] == TOHOST_ADDR);
+  assign commit1       = DUAL && commit && !tohost_commit && (rob_count >= (RW+1)'(2))
+                      && rob_complete[rob_head1];
+  assign commit_data1  = prf[rob_newp[rob_head1]];
+
   // Is any ROB entry older than the op completing now on the single-cycle port
   // (sc) or the multiplier port (mul) still incomplete? Feeds the debug counter.
-  logic older_incomplete_sc, older_incomplete_mul;
+  logic older_incomplete_sc, older_incomplete_mul, older_incomplete_p1;
   always_comb begin
-    logic [RW-1:0] age_j, age_sc, age_mul;
+    logic [RW-1:0] age_j, age_sc, age_mul, age_p1;
     older_incomplete_sc  = 1'b0;
     older_incomplete_mul = 1'b0;
+    older_incomplete_p1  = 1'b0;
     age_sc  = iq_rob[s_idx] - rob_head;
     age_mul = mul_rob - rob_head;
+    age_p1  = iq_rob[s1_idx] - rob_head;
     for (int j = 0; j < ROB_DEPTH; j++) begin
       age_j = RW'(j) - rob_head;
       if ((age_j < age_sc)  && !rob_complete[j]) older_incomplete_sc  = 1'b1;
       if ((age_j < age_mul) && !rob_complete[j]) older_incomplete_mul = 1'b1;
+      if ((age_j < age_p1)  && !rob_complete[j]) older_incomplete_p1  = 1'b1;
     end
   end
 
   logic [1:0] ooo_events;
-  assign ooo_events = 2'(sc_fire && older_incomplete_sc) + 2'(mul_done && older_incomplete_mul);
+  assign ooo_events = 2'(sc_fire && older_incomplete_sc) + 2'(mul_done && older_incomplete_mul)
+                    + 2'(issue1 && older_incomplete_p1);
 
   // ---------------------------------------------------------------------------
   // Sequential state
@@ -535,21 +721,31 @@ module vortex_ooo_core
       dbg_wb_data         <= '0;
       dbg_mlstat_sat      <= 1'b0;
       dbg_ooo_completions <= '0;
+      dbg_dual_commits    <= '0;
+      dbg1_retire_valid   <= 1'b0;
+      dbg1_retire_pc      <= '0;
+      dbg1_wb_valid       <= 1'b0;
+      dbg1_wb_rd          <= '0;
+      dbg1_wb_data        <= '0;
     end else begin
       // ---- Dispatch: rename, allocate ROB / IQ / memory-queue entries ----
       if (dispatch) begin
         if (is_jal) begin
           pc <= pc + imm;
-        end else begin
+        end else if (!dispatch1) begin
           pc <= pc + INST_BYTES;
+        end else if (is_jal1) begin
+          pc <= imem_addr1 + imm1;
+        end else begin
+          pc <= imem_addr1 + INST_BYTES;
         end
-        if (d_ctrl_wait) fe_wait <= 1'b1;
+        if (d_ctrl_wait || (dispatch1 && d_ctrl_wait1)) fe_wait <= 1'b1;
 
         if (d_has_rd) begin
           spec_rat[rd_addr]  <= d_newp;
           preg_ready[d_newp] <= 1'b0;
-          fl_head            <= fl_head + PW'(1);
         end
+        fl_head <= fl_head + PW'(d_has_rd) + PW'(dispatch1 && d_has_rd1);
 
         rob_pc[rob_tail]       <= pc;
         rob_rd[rob_tail]       <= rd_addr;
@@ -559,7 +755,7 @@ module vortex_ooo_core
         rob_complete[rob_tail] <= 1'b0;
         rob_sat[rob_tail]      <= 1'b0;
         rob_illegal[rob_tail]  <= dec_illegal;
-        rob_tail               <= rob_tail + RW'(1);
+        rob_tail               <= rob_tail + RW'(1) + RW'(dispatch1);
 
         iq_valid[iq_free_idx]   <= 1'b1;
         iq_fu[iq_free_idx]      <= d_fu;
@@ -591,7 +787,56 @@ module vortex_ooo_core
           mq_uns[mq_tail]    <= load_unsigned;
           mq_dst[mq_tail]    <= d_newp;
           mq_has_rd[mq_tail] <= d_has_rd;
-          mq_tail            <= mq_tail + MW'(1);
+        end
+        mq_tail <= mq_tail + MW'(d_is_mem) + MW'(dispatch1 && d_is_mem1);
+      end
+
+      // ---- Dispatch slot 1 (younger; its RAT write wins over slot 0's) ----
+      if (dispatch1) begin
+        if (d_has_rd1) begin
+          spec_rat[rd_addr1]  <= d_newp1;
+          preg_ready[d_newp1] <= 1'b0;
+        end
+
+        rob_pc[rob_tail1]       <= imem_addr1;
+        rob_rd[rob_tail1]       <= rd_addr1;
+        rob_has_rd[rob_tail1]   <= d_has_rd1;
+        rob_newp[rob_tail1]     <= d_newp1;
+        rob_oldp[rob_tail1]     <= d_oldp1;
+        rob_complete[rob_tail1] <= 1'b0;
+        rob_sat[rob_tail1]      <= 1'b0;
+        rob_illegal[rob_tail1]  <= dec_illegal1;
+
+        iq_valid[iq_free_idx2]   <= 1'b1;
+        iq_fu[iq_free_idx2]      <= d_fu1;
+        iq_rob[iq_free_idx2]     <= rob_tail1;
+        iq_memq[iq_free_idx2]    <= mq_tail1;
+        iq_pc[iq_free_idx2]      <= imem_addr1;
+        iq_imm[iq_free_idx2]     <= imm1;
+        iq_src1[iq_free_idx2]    <= d_src1_1;
+        iq_src2[iq_free_idx2]    <= d_src2_1;
+        iq_src3[iq_free_idx2]    <= d_src3_1;
+        iq_dst[iq_free_idx2]     <= d_newp1;
+        iq_has_rd[iq_free_idx2]  <= d_has_rd1;
+        iq_alu_op[iq_free_idx2]  <= alu_op1;
+        iq_a_pc[iq_free_idx2]    <= alu_a_pc1;
+        iq_b_imm[iq_free_idx2]   <= alu_b_imm1;
+        iq_link[iq_free_idx2]    <= (wb_src1 == WB_PC4);
+        iq_branch[iq_free_idx2]  <= is_branch1;
+        iq_jalr[iq_free_idx2]    <= is_jalr1;
+        iq_bf3[iq_free_idx2]     <= branch_f3_1;
+        iq_md_op[iq_free_idx2]   <= md_op1;
+        iq_md_word[iq_free_idx2] <= md_word1;
+        iq_xm_op[iq_free_idx2]   <= xm_op1;
+
+        if (d_is_mem1) begin
+          mq_store[mq_tail1]  <= is_store1;
+          mq_rob[mq_tail1]    <= rob_tail1;
+          mq_ready[mq_tail1]  <= 1'b0;
+          mq_size[mq_tail1]   <= mem_size1;
+          mq_uns[mq_tail1]    <= load_unsigned1;
+          mq_dst[mq_tail1]    <= d_newp1;
+          mq_has_rd[mq_tail1] <= d_has_rd1;
         end
       end
 
@@ -613,6 +858,25 @@ module vortex_ooo_core
           pc <= jalr_target;
         end else if (br_taken) begin
           pc <= br_target;
+        end
+        fe_wait <= 1'b0;
+      end
+      if (issue1) begin
+        iq_valid[s1_idx] <= 1'b0;
+        if (iq_has_rd[s1_idx]) begin
+          prf[iq_dst[s1_idx]]        <= p1_res;
+          preg_ready[iq_dst[s1_idx]] <= 1'b1;
+        end
+        rob_complete[iq_rob[s1_idx]] <= 1'b1;
+        rob_sat[iq_rob[s1_idx]]      <= 1'b0;
+      end
+      if (redirect1) begin
+        // At most one branch/JALR is ever in flight, so redirect and redirect1
+        // never fire together.
+        if (iq_jalr[s1_idx]) begin
+          pc <= (p1_op1 + p1_imm) & ~XLEN'(1);
+        end else if (p1_taken) begin
+          pc <= p1_pc + p1_imm;
         end
         fe_wait <= 1'b0;
       end
@@ -660,31 +924,50 @@ module vortex_ooo_core
 
       // ---- Commit ----
       if (commit) begin
-        rob_head <= rob_head + RW'(1);
+        rob_head <= rob_head + RW'(1) + RW'(commit1);
         if (rob_has_rd[rob_head]) begin
           arch_rat[rob_rd[rob_head]] <= rob_newp[rob_head];
           fl_q[fl_tail]              <= rob_oldp[rob_head];
-          fl_tail                    <= fl_tail + PW'(1);
         end
+        fl_tail <= fl_tail + PW'(rob_has_rd[rob_head]) + PW'(commit1 && rob_has_rd[rob_head1]);
         dbg_retire_valid <= 1'b1;
         dbg_retire_pc    <= rob_pc[rob_head];
         dbg_wb_valid     <= rob_has_rd[rob_head];
         dbg_wb_rd        <= rob_rd[rob_head];
         dbg_wb_data      <= rob_has_rd[rob_head] ? commit_data : '0;
         if (rob_sat[rob_head]) dbg_mlstat_sat <= 1'b1;
-        if (st_fire && (mq_addr[mq_head] == TOHOST_ADDR)) halted <= 1'b1;
+        if (tohost_commit) halted <= 1'b1;
       end else begin
         dbg_retire_valid <= 1'b0;
         dbg_wb_valid     <= 1'b0;
+      end
+      if (commit1) begin
+        if (rob_has_rd[rob_head1]) begin
+          arch_rat[rob_rd[rob_head1]]                  <= rob_newp[rob_head1];
+          fl_q[fl_tail + PW'(rob_has_rd[rob_head])] <= rob_oldp[rob_head1];
+        end
+        dbg1_retire_valid <= 1'b1;
+        dbg1_retire_pc    <= rob_pc[rob_head1];
+        dbg1_wb_valid     <= rob_has_rd[rob_head1];
+        dbg1_wb_rd        <= rob_rd[rob_head1];
+        dbg1_wb_data      <= rob_has_rd[rob_head1] ? commit_data1 : '0;
+        if (rob_sat[rob_head1]) dbg_mlstat_sat <= 1'b1;
+        dbg_dual_commits  <= dbg_dual_commits + DBG_CNT_W'(1);
+      end else begin
+        dbg1_retire_valid <= 1'b0;
+        dbg1_wb_valid     <= 1'b0;
       end
 
       dbg_ooo_completions <= dbg_ooo_completions + DBG_CNT_W'(ooo_events);
 
       // ---- Occupancy counters (allocate and release may coincide) ----
-      rob_count <= rob_count + (RW+1)'(dispatch) - (RW+1)'(commit);
-      mq_count  <= mq_count + (MW+1)'(dispatch && d_is_mem) - (MW+1)'(ld_fire || st_fire);
-      fl_count  <= fl_count - (PW+1)'(dispatch && d_has_rd)
-                            + (PW+1)'(commit && rob_has_rd[rob_head]);
+      rob_count <= rob_count + (RW+1)'(dispatch) + (RW+1)'(dispatch1)
+                             - (RW+1)'(commit) - (RW+1)'(commit1);
+      mq_count  <= mq_count + (MW+1)'(dispatch && d_is_mem) + (MW+1)'(dispatch1 && d_is_mem1)
+                            - (MW+1)'(ld_fire || st_fire);
+      fl_count  <= fl_count - (PW+1)'(dispatch && d_has_rd) - (PW+1)'(dispatch1 && d_has_rd1)
+                            + (PW+1)'(commit && rob_has_rd[rob_head])
+                            + (PW+1)'(commit1 && rob_has_rd[rob_head1]);
     end
   end
 
@@ -696,6 +979,10 @@ module vortex_ooo_core
     if (commit && rob_illegal[rob_head]) begin
       $display("[vortex_ooo_core] WARNING: illegal/unsupported instruction at pc=%016h",
                rob_pc[rob_head]);
+    end
+    if (commit1 && rob_illegal[rob_head1]) begin
+      $display("[vortex_ooo_core] WARNING: illegal/unsupported instruction at pc=%016h",
+               rob_pc[rob_head1]);
     end
     // With nothing in flight the speculative and committed maps must agree.
     if (rob_count == '0) begin

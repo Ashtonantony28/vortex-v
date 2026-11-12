@@ -5,7 +5,7 @@ name: CI
 #               including the RTL<->ISS lockstep co-sim and the riscv-tests
 #               RV64I/RV64M conformance suite (on both the ISS and the RTL).
 #   2. lint   - verilator --lint-only -Wall over rtl/core/files.f, for both
-#               tops (vortex_core and vortex_ooo_core).
+#               tops (vortex_core, and vortex_ooo_core at WIDTH 1 and 2).
 
 # Push runs the suite only on main + tags; every other branch is covered by its
 # pull_request run, so feature branches are tested once, not twice.
@@ -58,3 +58,4 @@ jobs:
         run: |
           verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
           verilator --lint-only -Wall --top-module vortex_ooo_core -f rtl/core/files.f
+          verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -f rtl/core/files.f

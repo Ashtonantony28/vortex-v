@@ -33,6 +33,14 @@ Ports (synchronous, active-low reset `rst_n`, single clock `clk`):
   These let the cocotb co-sim compare each retired instruction's (pc, rd, data)
   against the ISS. x0 writes must report `dbg_wb_valid=0` or data 0.
 
+## v1.1 additive ports (ADR 0007, two-wide `vortex_ooo_core`)
+`vortex_ooo_core` has every v1 port above plus these. `vortex_core` keeps v1 only; the
+harness serves and reads the extra ports only when the toplevel has them.
+- **Second fetch port:** out `imem_addr1` [63:0] (always `imem_addr + 4`), in `imem_rdata1` [31:0].
+- **Second retire slot:** out `dbg1_retire_valid`, `dbg1_retire_pc` [63:0], `dbg1_wb_valid`,
+  `dbg1_wb_rd` [4:0], `dbg1_wb_data` [63:0]. In a cycle where both slots are valid, slot 0 is
+  the older instruction. Slot 1 is never valid without slot 0. With `WIDTH=1` it stays 0.
+
 ## Golden model contract (`model/iss/rv64i.py`)
 A pure-Python RV64I instruction-set simulator:
 - `step()` executes one instruction, returns a record `{pc, inst, rd, rd_val, mem}`.
