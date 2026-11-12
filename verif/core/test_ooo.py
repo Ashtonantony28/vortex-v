@@ -150,6 +150,7 @@ XM_K = 16              # activation vectors in the int8 kernel
 XM_CH = 4              # output channels (independent accumulators)
 XM_MACS = XM_K * XM_CH * 8
 MIN_XM_RATIO = 0.85    # pipelined (XM_LATENCY=3) vs single-cycle Xmlacc MACs/cycle
+MIN_XM2_SPEEDUP = 1.25 # two Xmlacc units (XM_PORTS=2) vs one, MACs/cycle (ADR 0013)
 
 
 def xm_program():
@@ -283,3 +284,20 @@ def test_pipelined_xmlacc_keeps_mac_throughput(tmp_path):
     assert rate_piped >= MIN_XM_RATIO * rate_single, \
         f"pipelined {rate_piped:.2f} MACs/cycle vs {rate_single:.2f} single-cycle " \
         f"(need >= {MIN_XM_RATIO:.0%})"
+
+
+def test_second_xmlacc_unit_raises_mac_throughput(tmp_path):
+    """The board configuration (_sync) has XM_PORTS=2 *and* synchronous memory. Sync
+    memory only adds latency, so beating the one-unit combinational-memory core (_xm)
+    is a conservative check that issue port 1 really runs maccs (ADR 0013)."""
+    one = _measure("vortex_ooo_core_xm", tmp_path)["xm"]
+    two = _measure("vortex_ooo_core_sync", tmp_path)["xm"]
+    assert two["dbg_xm_macs"] == XM_MACS, \
+        f"{two['dbg_xm_macs']} MACs counted, expected {XM_MACS}"
+    rate_one = XM_MACS / one["cycles"]
+    rate_two = XM_MACS / two["cycles"]
+    print(f"int8 kernel: {rate_one:.2f} MACs/cycle with one Xmlacc unit, "
+          f"{rate_two:.2f} with two")
+    assert rate_two >= MIN_XM2_SPEEDUP * rate_one, \
+        f"two units {rate_two:.2f} MACs/cycle vs {rate_one:.2f} with one " \
+        f"(need >= {MIN_XM2_SPEEDUP:.2f}x)"

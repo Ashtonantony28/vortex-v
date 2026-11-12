@@ -44,6 +44,14 @@ DEFAULT_MIX = {
     "load": 12, "store": 9, "branch": 7, "jal": 2, "jalr": 2, "loop": 3,
 }
 
+# Xmlacc-heavy mix: dense maccs around mispredicting branches, so the Xmlacc
+# pipelines (ADR 0010) and the second unit (ADR 0013) see squashes mid-flight.
+XM_MIX = {
+    "alu_rr": 10, "alu_ri": 6, "shift": 2, "upper": 1, "muldiv": 2, "xmlacc": 30,
+    "load": 6, "store": 4, "branch": 14, "jal": 1, "jalr": 1, "loop": 3,
+}
+MIXES = {"default": DEFAULT_MIX, "xm": XM_MIX}
+
 
 def _interesting64(rng):
     """Register seed values biased toward the edges where bugs live."""

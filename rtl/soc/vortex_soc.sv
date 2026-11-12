@@ -26,6 +26,7 @@ module vortex_soc
   parameter int unsigned      LSQ           = 0,
   parameter int unsigned      XM_LATENCY    = 1,
   parameter int unsigned      SYNC_MEM      = 0,      // 1 = block-RAM-style memory (ADR 0012)
+  parameter int unsigned      XM_PORTS      = 1,      // 2 = second Xmlacc unit, WIDTH=2 only (ADR 0013)
   parameter int unsigned      RAM_BYTES     = 16384,
   parameter logic [XLEN-1:0]  RAM_BASE      = 64'h8000_0000,
   parameter logic [XLEN-1:0]  TOHOST_ADDR   = 64'h8000_1000,
@@ -52,6 +53,8 @@ module vortex_soc
   initial begin
     if (SYNC_MEM != 0 && !CORE_OOO)
       $fatal(1, "vortex_soc: SYNC_MEM needs the out-of-order core (ADR 0012)");
+    if (XM_PORTS != 1 && !CORE_OOO)
+      $fatal(1, "vortex_soc: XM_PORTS needs the out-of-order core (ADR 0013)");
   end
 
   // ---- Core ----
@@ -72,7 +75,8 @@ module vortex_soc
       .SPEC_BRANCHES (SPEC_BRANCHES),
       .LSQ           (LSQ),
       .XM_LATENCY    (XM_LATENCY),
-      .SYNC_MEM      (SYNC_MEM)
+      .SYNC_MEM      (SYNC_MEM),
+      .XM_PORTS      (XM_PORTS)
     ) u_core (
       .clk               (clk),
       .rst_n             (rst_n),
