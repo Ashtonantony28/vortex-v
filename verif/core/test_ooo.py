@@ -22,6 +22,10 @@ A second program checks the two-wide configuration (ADR 0007): independent ALU
 ops must commit two per cycle (debug counter `dbg_dual_commits`) and finish in
 well under the in-order core's cycle count.
 
+A sixth program, an int8 matrix-vector kernel, reports MACs per cycle and checks
+that a pipelined Xmlacc unit (ADR 0010) keeps the single-cycle unit's throughput
+when the accumulators are independent.
+
 A fifth program checks the load/store queue (ADR 0009): loads behind a store that
 is waiting to commit must run early, one must forward from the store, and the run
 must beat the in-order memory queue.
@@ -142,8 +146,43 @@ def lsq_program():
     return a.assemble()
 
 
+XM_K = 16              # activation vectors in the int8 kernel
+XM_CH = 4              # output channels (independent accumulators)
+XM_MACS = XM_K * XM_CH * 8
+MIN_XM_RATIO = 0.85    # pipelined (XM_LATENCY=3) vs single-cycle Xmlacc MACs/cycle
+
+
+def xm_program():
+    """An int8 matrix-vector kernel: 4 output channels, weights held in registers,
+    16 activation vectors streamed from memory, one macc per channel per vector.
+    The 4 accumulators are independent, so a pipelined Xmlacc unit can start one
+    macc per cycle and its latency hides behind the other channels (ADR 0010)."""
+    a = Asm()
+    a.la(30, DATA_BASE)
+    for c in range(XM_CH):
+        a.ld(10 + c, 30, 8 * c)          # weights
+        a.addi(20 + c, 0, 0)             # accumulators
+    for k in range(XM_K):
+        a.ld(1 + k % 8, 30, 64 + 8 * k)  # activations
+        for c in range(XM_CH):
+            a.macc(20 + c, 1 + k % 8, 10 + c, 20 + c)
+    for c in range(XM_CH):
+        a.sd(20 + c, 30, 512 + 8 * c)
+    a.la(31, TOHOST_ADDR)
+    a.addi(26, 0, 1)
+    a.sw(26, 31, 0)
+    return a.assemble()
+
+
+def xm_data():
+    vals = [(0x0123_4567_89AB_CDEF * (i + 3)) & ((1 << 64) - 1) for i in range(8 + XM_K)]
+    return [(DATA_BASE + 8 * i, 8, v) for i, v in enumerate(vals[:XM_CH])] + \
+           [(DATA_BASE + 64 + 8 * k, 8, v) for k, v in enumerate(vals[8:])]
+
+
 PROGRAMS = {"overlap": overlap_program, "wide": wide_program, "loop": loop_program,
-            "lsq": lsq_program}
+            "lsq": lsq_program, "xm": xm_program}
+PROGRAM_DATA = {"xm": xm_data}
 
 try:
     import cocotb
@@ -157,12 +196,13 @@ if cocotb is not None:
         from harness import cosim_lockstep
         results = {}
         for name, prog in PROGRAMS.items():
-            _, state, _ = await cosim_lockstep(dut, name, prog(), max_cycles=2000,
+            data = PROGRAM_DATA[name]() if name in PROGRAM_DATA else None
+            _, state, _ = await cosim_lockstep(dut, name, prog(), data=data, max_cycles=2000,
                                                mem_check=(DATA_BASE, DATA_SIZE))
             res = {"cycles": state["cycles"]}
             for counter in ("dbg_ooo_completions", "dbg_dual_commits",
                             "dbg_spec_branches", "dbg_mispredicts",
-                            "dbg_lsq_forwards", "dbg_lsq_early"):
+                            "dbg_lsq_forwards", "dbg_lsq_early", "dbg_xm_macs"):
                 if hasattr(dut, counter):
                     res[counter] = int(getattr(dut, counter).value)
             dut._log.info("%s: %s", name, res)
@@ -228,3 +268,18 @@ def test_lsq_runs_loads_past_a_waiting_store(tmp_path):
         f"only {lsq['dbg_lsq_early']} loads ran ahead of the queue head"
     assert lsq["cycles"] <= MAX_RATIO_LSQ * plain["cycles"], \
         f"LSQ {lsq['cycles']} cycles vs {plain['cycles']} without (need <= {MAX_RATIO_LSQ:.0%})"
+
+
+def test_pipelined_xmlacc_keeps_mac_throughput(tmp_path):
+    single = _measure("vortex_ooo_core_lsq", tmp_path)["xm"]
+    piped = _measure("vortex_ooo_core_xm", tmp_path)["xm"]
+    for res in (single, piped):
+        assert res["dbg_xm_macs"] == XM_MACS, \
+            f"{res['dbg_xm_macs']} MACs counted, expected {XM_MACS}"
+    rate_single = XM_MACS / single["cycles"]
+    rate_piped = XM_MACS / piped["cycles"]
+    print(f"int8 kernel: {rate_single:.2f} MACs/cycle at XM_LATENCY=1, "
+          f"{rate_piped:.2f} at XM_LATENCY=3")
+    assert rate_piped >= MIN_XM_RATIO * rate_single, \
+        f"pipelined {rate_piped:.2f} MACs/cycle vs {rate_single:.2f} single-cycle " \
+        f"(need >= {MIN_XM_RATIO:.0%})"

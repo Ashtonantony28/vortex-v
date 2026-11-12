@@ -473,6 +473,93 @@ async def mispredict_squashes_waiting_jalr(dut):
                          mem_check=(DATA_BASE, DATA_SIZE))
 
 
+# Packed int8 vectors for the Xmlacc out-of-order tests (ADR 0010)
+XM_VECS = [0x7F80_01FF_0203_FE7F, 0x0102_0304_0506_0708, 0x8080_8080_7F7F_7F7F,
+           0xFFFE_FDFC_FBFA_F9F8, 0x1122_3344_5566_7788, 0x0000_0000_0000_0001]
+
+
+def _xm_data():
+    return [(DATA_BASE + 8 * i, 8, v) for i, v in enumerate(XM_VECS)]
+
+
+@cocotb.test()
+async def xmlacc_ooo_accumulator_chains(dut):
+    """Two macc accumulator chains interleaved with independent dot products: the
+    accumulator (rs3) is renamed like any source, so each chain sees its own
+    previous sum and nothing else, at any Xmlacc latency (ADR 0010)."""
+    a = Asm()
+    a.la(30, DATA_BASE)
+    for i in range(len(XM_VECS)):
+        a.ld(1 + i, 30, 8 * i)
+    a.addi(10, 0, 0)
+    a.addi(11, 0, -5)
+    for k in range(6):
+        a.macc(10, 1 + k % 6, 1 + (k + 1) % 6, 10)    # chain A
+        a.macc(11, 1 + (k + 2) % 6, 1 + k % 6, 11)    # chain B
+        a.dot8(12 + k % 3, 1 + k % 6, 2)              # independent
+        a.dot8su(15, 3, 1 + k % 6)
+    a.macc(10, 1, 2, 11)                              # cross the chains once
+    a.rqs(16, 10, 0)
+    a.add(17, 10, 11)
+    a.sd(17, 30, 64)
+    a.la(31, TOHOST_ADDR)
+    a.addi(9, 0, 1)
+    a.sw(9, 31, 0)
+    await cosim_lockstep(dut, "xm_chains", a.assemble(), data=_xm_data(), max_cycles=1500,
+                         mem_check=(DATA_BASE, DATA_SIZE))
+
+
+@cocotb.test()
+async def xmlacc_ooo_late_accumulator(dut):
+    """A macc whose accumulator comes from a divide and whose vectors come from
+    loads: it must wait for all three sources, while younger independent Xmlacc
+    ops run ahead of it."""
+    a = Asm()
+    a.la(30, DATA_BASE)
+    a.addi(1, 0, 1000)
+    a.addi(2, 0, 7)
+    a.div(3, 1, 2)                   # late accumulator
+    a.ld(4, 30, 0)
+    a.ld(5, 30, 8)
+    a.macc(6, 4, 5, 3)               # waits on the divide
+    a.dot8(7, 4, 4)                  # free to run ahead
+    a.dot8u(8, 5, 5)
+    a.macc(9, 4, 5, 7)               # chains on a younger op that finished first
+    a.add(10, 6, 9)
+    a.sd(10, 30, 64)
+    a.la(31, TOHOST_ADDR)
+    a.addi(11, 0, 1)
+    a.sw(11, 31, 0)
+    await cosim_lockstep(dut, "xm_late_acc", a.assemble(), data=_xm_data(), max_cycles=1000,
+                         mem_check=(DATA_BASE, DATA_SIZE))
+
+
+@cocotb.test()
+async def xmlacc_ooo_mispredict_drops_inflight(dut):
+    """Xmlacc ops on a mispredicted path, some already inside a pipelined unit
+    when the branch resolves, must never write a register or set SAT."""
+    a = Asm()
+    a.la(30, DATA_BASE)
+    a.ld(1, 30, 16)                  # 0x80.. / 0x7F.. lanes: large dot products
+    a.ld(2, 30, 16)
+    a.addi(3, 0, 3)
+    a.mul(10, 3, 0)                  # x10 = 0, late: the wrong path dispatches first
+    a.beq(10, 0, "target")           # taken; a cold predictor says not-taken
+    for r in (20, 21, 22, 23):       # wrong path: back-to-back Xmlacc ops
+        a.macc(r, 1, 2, r)
+    a.dot8(24, 1, 2)
+    a.rqs(25, 24, 0)                 # would saturate and set SAT
+    a.label("target")
+    a.add(26, 20, 21)                # must read the old (zero) values
+    a.add(26, 26, 25)
+    a.sd(26, 30, 64)
+    a.la(31, TOHOST_ADDR)
+    a.addi(9, 0, 1)
+    a.sw(9, 31, 0)
+    await cosim_lockstep(dut, "xm_mispredict", a.assemble(), data=_xm_data(), max_cycles=1000,
+                         mem_check=(DATA_BASE, DATA_SIZE))
+
+
 @cocotb.test()
 async def cosim_against_iss(dut):
     """Lockstep co-sim of the RTL against the golden ISS (model/iss/rv64i.py).

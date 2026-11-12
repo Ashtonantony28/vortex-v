@@ -45,7 +45,9 @@ module vortex_ooo_core
   parameter int unsigned      WIDTH       = 1,   // 1 = ADR 0006 scalar, 2 = ADR 0007 two-wide
   parameter int unsigned      SPEC_BRANCHES = 0, // unresolved predicted branches in flight (0/1)
   parameter int unsigned      BHT_ENTRIES = 64,  // 2-bit branch counters (power of 2)
-  parameter int unsigned      LSQ         = 0    // 1 = loads pass older stores (ADR 0009)
+  parameter int unsigned      LSQ         = 0,   // 1 = loads pass older stores (ADR 0009)
+  parameter int unsigned      XM_LATENCY  = 1    // Xmlacc cycles: 1 = single-cycle port,
+                                                 // 2..8 = pipelined unit, own port (ADR 0010)
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -96,6 +98,9 @@ module vortex_ooo_core
   localparam bit          SPEC      = (SPEC_BRANCHES != 0);
   localparam int unsigned BW        = $clog2(BHT_ENTRIES);
   localparam bit          USE_LSQ   = (LSQ != 0);
+  localparam bit          XMP       = (XM_LATENCY > 1);              // pipelined Xmlacc
+  localparam int unsigned XS        = XMP ? (XM_LATENCY - 1) : 1;    // its register stages
+  localparam int unsigned XM_LANES  = XLEN / 8;                      // int8 MACs per op
 
   // Parameter checks (ADR 0006 item 8). Evaluated at time zero in simulation and
   // by lint; a bad configuration stops the run before any instruction executes.
@@ -105,6 +110,8 @@ module vortex_ooo_core
              NUM_PREGS, ROB_DEPTH);
     if ((1 << PW) != NUM_PREGS || (1 << RW) != ROB_DEPTH || (1 << MW) != MEMQ_DEPTH)
       $fatal(1, "vortex_ooo_core: NUM_PREGS, ROB_DEPTH and MEMQ_DEPTH must be powers of 2");
+    if (XM_LATENCY < 1 || XM_LATENCY > 8)
+      $fatal(1, "vortex_ooo_core: XM_LATENCY (%0d) must be 1..8", XM_LATENCY);
     if (SPEC_BRANCHES > 1 || (1 << BW) != BHT_ENTRIES)
       $fatal(1, "vortex_ooo_core: SPEC_BRANCHES must be 0 or 1 and BHT_ENTRIES a power of 2");
     if (WIDTH < 1 || WIDTH > 2)
@@ -200,6 +207,8 @@ module vortex_ooo_core
   // Debug (LSQ): loads answered from a store, and loads executed behind an
   // older memory operation still in the queue.
   logic [DBG_CNT_W-1:0] dbg_lsq_forwards, dbg_lsq_early;
+  // Debug: int8 multiply-accumulates done by completed Xmlacc ops (8 per dot8/macc).
+  logic [DBG_CNT_W-1:0] dbg_xm_macs;
 
   // ---------------------------------------------------------------------------
   // Fetch + decode
@@ -592,13 +601,31 @@ module vortex_ooo_core
     .sat    (xm_sat)
   );
 
-  // Single-cycle writeback port: whichever of ALU / Xmlacc issued this cycle.
+  logic xm_issue, xm_is_mac, xm_rqs_sat;
+  assign xm_issue   = issue && (i_fu == FU_XM);
+  assign xm_is_mac  = (xmlacc_op_e'(iq_xm_op[s_idx]) != XM_RQS);
+  assign xm_rqs_sat = (xmlacc_op_e'(iq_xm_op[s_idx]) == XM_RQS) && xm_sat;
+
+  // Single-cycle writeback port: the ALU, and Xmlacc when XM_LATENCY=1.
   logic            sc_fire;
   logic [XLEN-1:0] sc_data;
   logic            sc_sat;
-  assign sc_fire = issue && ((i_fu == FU_ALU) || (i_fu == FU_XM));
+  assign sc_fire = issue && ((i_fu == FU_ALU) || (!XMP && (i_fu == FU_XM)));
   assign sc_data = (i_fu == FU_XM) ? xm_result : alu_res;
-  assign sc_sat  = (i_fu == FU_XM) && (xmlacc_op_e'(iq_xm_op[s_idx]) == XM_RQS) && xm_sat;
+  assign sc_sat  = (i_fu == FU_XM) && xm_rqs_sat;
+
+  // Pipelined Xmlacc (XM_LATENCY > 1, ADR 0010): the result passes XS register
+  // stages and writes back on its own port, one op per cycle. Stage XS-1 writes
+  // back. A squash drops the stages holding ops younger than the branch.
+  logic            xp_valid  [XS];
+  logic            xp_has_rd [XS];
+  logic            xp_mac    [XS];
+  logic            xp_sat    [XS];
+  logic [PW-1:0]   xp_dst    [XS];
+  logic [RW-1:0]   xp_rob    [XS];
+  logic [XLEN-1:0] xp_data   [XS];
+  logic            xp_wb;
+  assign xp_wb = XMP && xp_valid[XS-1];
 
   // ---------------------------------------------------------------------------
   // Multiplier and divider FUs: two instances of the shared RV64M unit, so a
@@ -877,6 +904,8 @@ module vortex_ooo_core
       dbg_mispredicts     <= '0;
       dbg_lsq_forwards    <= '0;
       dbg_lsq_early       <= '0;
+      dbg_xm_macs         <= '0;
+      for (int k = 0; k < XS; k++) xp_valid[k] <= 1'b0;
       spec_active         <= 1'b0;
       br_rob              <= '0;
       ckpt_fl_head        <= '0;
@@ -1054,6 +1083,39 @@ module vortex_ooo_core
         mq_addr[iq_memq[s_idx]]  <= agu_addr;
         mq_data[iq_memq[s_idx]]  <= op2;
       end
+      if (!XMP && xm_issue && xm_is_mac) begin
+        dbg_xm_macs <= dbg_xm_macs + DBG_CNT_W'(XM_LANES);
+      end
+
+      // ---- Pipelined Xmlacc: advance, drop squashed ops, write back ----
+      if (XMP) begin
+        xp_valid[0]  <= xm_issue && !(squash && ((iq_rob[s_idx] - rob_head) > br_age));
+        xp_has_rd[0] <= iq_has_rd[s_idx];
+        xp_mac[0]    <= xm_is_mac;
+        xp_sat[0]    <= xm_rqs_sat;
+        xp_dst[0]    <= iq_dst[s_idx];
+        xp_rob[0]    <= iq_rob[s_idx];
+        xp_data[0]   <= xm_result;
+        for (int k = 1; k < XS; k++) begin
+          xp_valid[k]  <= xp_valid[k-1] && !(squash && ((xp_rob[k-1] - rob_head) > br_age));
+          xp_has_rd[k] <= xp_has_rd[k-1];
+          xp_mac[k]    <= xp_mac[k-1];
+          xp_sat[k]    <= xp_sat[k-1];
+          xp_dst[k]    <= xp_dst[k-1];
+          xp_rob[k]    <= xp_rob[k-1];
+          xp_data[k]   <= xp_data[k-1];
+        end
+      end
+      if (xp_wb) begin
+        if (xp_has_rd[XS-1]) begin
+          prf[xp_dst[XS-1]]        <= xp_data[XS-1];
+          preg_ready[xp_dst[XS-1]] <= 1'b1;
+        end
+        rob_complete[xp_rob[XS-1]] <= 1'b1;
+        rob_sat[xp_rob[XS-1]]      <= xp_sat[XS-1];
+        if (xp_mac[XS-1]) dbg_xm_macs <= dbg_xm_macs + DBG_CNT_W'(XM_LANES);
+      end
+
       if (mul_start) begin
         mul_dst    <= iq_dst[s_idx];
         mul_has_rd <= iq_has_rd[s_idx];

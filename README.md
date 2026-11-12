@@ -3,14 +3,15 @@
 A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML extension
 (**Xmlacc**), targeting a **Digilent Arty A7-100T** FPGA and running TinyML kernels.
 
-> **Status: M7 (LSQ) — two-wide speculative out-of-order RV64IM + Xmlacc core, in simulation.** Two
+> **Status: M8 — two-wide speculative out-of-order RV64IM + Xmlacc core, in simulation.** Two
 > cores live in `rtl/core/`: the in-order reference `vortex_core` and the out-of-order
 > `vortex_ooo_core` (register renaming, 32-entry ROB, issue queue, separate
 > multiplier/divider/Xmlacc units; ADR 0006). Its `WIDTH` parameter selects 1-wide or 2-wide
 > dispatch, issue and commit (ADR 0007), and `SPEC_BRANCHES=1` adds a bimodal branch predictor
 > with speculative execution and checkpoint recovery (ADR 0008). `LSQ=1` lets loads run out of
 > order past older stores, with store-to-load forwarding (ADR 0009; the forwarding unit is proven
-> with yosys). All five configurations run
+> with yosys). `XM_LATENCY` makes the Xmlacc unit a pipelined functional unit with its own
+> writeback port (ADR 0010). All six configurations run
 > under Icarus via cocotb and are checked
 > instruction-by-instruction against a Python ISS golden model (`model/iss/`), on directed tests,
 > the riscv-tests rv64ui + rv64um suites (65 tests), and seeded constrained-random programs. Not

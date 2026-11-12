@@ -66,3 +66,11 @@ correctness failures — the full suite is green — but they're real and owned.
   covered by simulation only. ROB formal is not done.
 - **I15:** the L1 data cache named in the M7 roadmap row is deferred until a memory model with
   latency exists (ADR 0009 item 6).
+
+## M8
+- **I16 (performance, by design for M8):** Xmlacc issues only on port 0, which it shares with
+  loads, multiplies and divides. An int8 matrix-vector kernel reaches about 5.3 MACs/cycle, close
+  to the in-order core's 5.2, because port 0 is the bottleneck. A second Xmlacc unit on port 1 is
+  the fix (ADR 0010 follow-on).
+- **I17:** the pipelined Xmlacc stages (`XM_LATENCY` > 1) are output registers that rely on
+  synthesis retiming. Whether that meets timing on the Arty A7 is unknown until M9.
