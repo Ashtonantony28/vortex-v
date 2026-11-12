@@ -3,15 +3,17 @@
 A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML extension
 (**Xmlacc**), targeting a **Digilent Arty A7-100T** FPGA and running TinyML kernels.
 
-> **Status: M5 — two-wide out-of-order RV64IM + Xmlacc core, in simulation.** Two cores live in
-> `rtl/core/`: the in-order reference `vortex_core` and the out-of-order `vortex_ooo_core`
-> (register renaming, 32-entry ROB, issue queue, separate multiplier/divider/Xmlacc units, no
-> speculation yet; ADR 0006). Its `WIDTH` parameter selects 1-wide or 2-wide dispatch, issue and
-> commit (ADR 0007). All three configurations run under Icarus via cocotb and are checked
+> **Status: M6 — two-wide speculative out-of-order RV64IM + Xmlacc core, in simulation.** Two
+> cores live in `rtl/core/`: the in-order reference `vortex_core` and the out-of-order
+> `vortex_ooo_core` (register renaming, 32-entry ROB, issue queue, separate
+> multiplier/divider/Xmlacc units; ADR 0006). Its `WIDTH` parameter selects 1-wide or 2-wide
+> dispatch, issue and commit (ADR 0007), and `SPEC_BRANCHES=1` adds a bimodal branch predictor
+> with speculative execution and checkpoint recovery (ADR 0008). All four configurations run
+> under Icarus via cocotb and are checked
 > instruction-by-instruction against a Python ISS golden model (`model/iss/`), on directed tests,
 > the riscv-tests rv64ui + rv64um suites (65 tests), and seeded constrained-random programs. Not
-> built yet: speculation (M6), the LSQ (M7), the C extension, CSRs/traps, `riscv-arch-test`,
-> Spike, FPGA bitstream, and benchmarks.
+> built yet: the LSQ (M7), the C extension, CSRs/traps, `riscv-arch-test`, Spike, FPGA
+> bitstream, and benchmarks.
 > Every claim here is backed by a `Verify` command in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What this is
@@ -95,6 +97,7 @@ pytest isa/ model/ asm/ verif/ -q          # models, RTL co-sim, riscv-tests, ra
 verilator --lint-only -Wall --top-module vortex_core -f rtl/core/files.f
 verilator --lint-only -Wall --top-module vortex_ooo_core -f rtl/core/files.f
 verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -f rtl/core/files.f
+verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GSPEC_BRANCHES=1 -f rtl/core/files.f
 ```
 
 ## Roadmap

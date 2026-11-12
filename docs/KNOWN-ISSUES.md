@@ -46,3 +46,12 @@ correctness failures — the full suite is green — but they're real and owned.
   Independent straight-line code reaches 2 per cycle. M6 (speculation) and M7 (LSQ) are the fix.
 - **I10:** issue port 1 is ALU/branch only (ADR 0007 item 5), so two multiplies, two loads or two
   Xmlacc ops never issue in the same cycle.
+
+## M6
+- **I11 (performance, by design for M6):** one predicted branch in flight (ADR 0008). A loop with
+  a second branch in its body waits at that branch for the first to resolve. JALR (calls and
+  returns) still stall. Random code gains almost nothing (500-seed soak: 4.31 ms vs 4.28 ms
+  simulated without speculation), because its branches are random by construction.
+- **I12:** speculative loads read memory before older branches resolve. That is safe here,
+  because the data memory has no side effects on reads. A future MMIO region with read side
+  effects must hold its loads until they are non-speculative.
