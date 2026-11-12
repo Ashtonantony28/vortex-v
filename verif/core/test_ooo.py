@@ -14,6 +14,10 @@ so ALU ops alone cannot show a speed-up: they still have to commit one by one
 after the divide. Multiplies stall the in-order core for 3 cycles each, but the
 OoO core runs them on its own multiplier while the divider is busy.
 
+A third program, a branchy loop, checks branch speculation (ADR 0008): the
+speculative core must predict every branch, recover from mispredicts, and beat
+the non-speculative two-wide core.
+
 A second program checks the two-wide configuration (ADR 0007): independent ALU
 ops must commit two per cycle (debug counter `dbg_dual_commits`) and finish in
 well under the in-order core's cycle count.
@@ -77,7 +81,33 @@ def wide_program():
     return a.assemble()
 
 
-PROGRAMS = {"overlap": overlap_program, "wide": wide_program}
+N_LOOP = 40            # iterations of the branchy loop
+MAX_RATIO_SPEC = 0.8   # speculative vs non-speculative two-wide cycles on that loop
+
+
+def loop_program():
+    """A counted loop with a forward branch inside that is taken one time in
+    four: both branches are mostly predictable, and each surprise is a mispredict."""
+    a = Asm()
+    a.addi(1, 0, N_LOOP)
+    a.label("top")
+    a.addi(2, 2, 1)
+    a.addi(3, 3, 3)
+    a.andi(4, 1, 3)
+    a.beq(4, 0, "skip")              # taken when the count is a multiple of 4
+    a.addi(5, 5, 7)
+    a.addi(6, 6, 9)
+    a.label("skip")
+    a.addi(7, 7, -1)
+    a.addi(1, 1, -1)
+    a.bne(1, 0, "top")
+    a.la(31, TOHOST_ADDR)
+    a.addi(26, 0, 1)
+    a.sw(26, 31, 0)
+    return a.assemble()
+
+
+PROGRAMS = {"overlap": overlap_program, "wide": wide_program, "loop": loop_program}
 
 try:
     import cocotb
@@ -94,7 +124,8 @@ if cocotb is not None:
             _, state, _ = await cosim_lockstep(dut, name, prog(), max_cycles=2000,
                                                mem_check=(DATA_BASE, DATA_SIZE))
             res = {"cycles": state["cycles"]}
-            for counter in ("dbg_ooo_completions", "dbg_dual_commits"):
+            for counter in ("dbg_ooo_completions", "dbg_dual_commits",
+                            "dbg_spec_branches", "dbg_mispredicts"):
                 if hasattr(dut, counter):
                     res[counter] = int(getattr(dut, counter).value)
             dut._log.info("%s: %s", name, res)
@@ -136,3 +167,15 @@ def test_two_wide_commits_two_per_cycle(tmp_path):
     assert wide["cycles"] <= MAX_RATIO_WIDE * inorder["cycles"], \
         f"two-wide {wide['cycles']} cycles vs in-order {inorder['cycles']} " \
         f"(need <= {MAX_RATIO_WIDE:.0%})"
+
+
+def test_speculation_runs_ahead_of_branches(tmp_path):
+    plain = _measure("vortex_ooo_core_w2", tmp_path)["loop"]
+    spec = _measure("vortex_ooo_core_spec", tmp_path)["loop"]
+    assert plain["dbg_spec_branches"] == 0, "SPEC_BRANCHES=0 must never predict"
+    assert spec["dbg_spec_branches"] >= 2 * N_LOOP, \
+        f"only {spec['dbg_spec_branches']} predicted branches"
+    assert spec["dbg_mispredicts"] > 0, "no mispredict: recovery was never exercised"
+    assert spec["cycles"] <= MAX_RATIO_SPEC * plain["cycles"], \
+        f"speculative {spec['cycles']} cycles vs {plain['cycles']} without " \
+        f"(need <= {MAX_RATIO_SPEC:.0%})"

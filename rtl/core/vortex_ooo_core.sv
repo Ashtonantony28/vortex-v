@@ -18,8 +18,11 @@
 //          only when it is also the ROB head, writing memory as it commits
 //   commit: in order, 1 per cycle, drives dbg_*; frees the old physical register
 //
-// No speculation: after a conditional branch or JALR, dispatch stops until it
-// executes and redirects fetch. JAL redirects at decode. Nothing is ever squashed.
+// Branches: with SPEC_BRANCHES=0 (default) dispatch stops after a conditional
+// branch until it executes (ADR 0006). With SPEC_BRANCHES=1 (ADR 0008) a 2-bit
+// BHT predicts it, fetch continues down the predicted path, and a mispredict
+// restores a RAT/free-list checkpoint and squashes everything younger. JALR
+// always stops dispatch until it executes. JAL redirects at decode.
 //
 // Wakeup is a global per-preg ready vector: a producer sets its bit as it writes
 // the PRF at the end of its execute cycle, and a consumer can issue the next
@@ -39,7 +42,9 @@ module vortex_ooo_core
   parameter int unsigned      ROB_DEPTH   = 32,  // reorder buffer entries (power of 2)
   parameter int unsigned      IQ_DEPTH    = 16,  // unified issue queue entries
   parameter int unsigned      MEMQ_DEPTH  = 8,   // in-order memory queue (power of 2)
-  parameter int unsigned      WIDTH       = 1    // 1 = ADR 0006 scalar, 2 = ADR 0007 two-wide
+  parameter int unsigned      WIDTH       = 1,   // 1 = ADR 0006 scalar, 2 = ADR 0007 two-wide
+  parameter int unsigned      SPEC_BRANCHES = 0, // unresolved predicted branches in flight (0/1)
+  parameter int unsigned      BHT_ENTRIES = 64   // 2-bit branch counters (power of 2)
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -87,6 +92,8 @@ module vortex_ooo_core
   localparam int unsigned DBG_CNT_W = 32;
   localparam logic [XLEN-1:0] INST_BYTES = XLEN'(4);
   localparam bit          DUAL      = (WIDTH == 2);
+  localparam bit          SPEC      = (SPEC_BRANCHES != 0);
+  localparam int unsigned BW        = $clog2(BHT_ENTRIES);
 
   // Parameter checks (ADR 0006 item 8). Evaluated at time zero in simulation and
   // by lint; a bad configuration stops the run before any instruction executes.
@@ -96,6 +103,8 @@ module vortex_ooo_core
              NUM_PREGS, ROB_DEPTH);
     if ((1 << PW) != NUM_PREGS || (1 << RW) != ROB_DEPTH || (1 << MW) != MEMQ_DEPTH)
       $fatal(1, "vortex_ooo_core: NUM_PREGS, ROB_DEPTH and MEMQ_DEPTH must be powers of 2");
+    if (SPEC_BRANCHES > 1 || (1 << BW) != BHT_ENTRIES)
+      $fatal(1, "vortex_ooo_core: SPEC_BRANCHES must be 0 or 1 and BHT_ENTRIES a power of 2");
     if (WIDTH < 1 || WIDTH > 2)
       $fatal(1, "vortex_ooo_core: WIDTH must be 1 or 2 (ADR 0002), got %0d", WIDTH);
     if (IQ_DEPTH < 2 || IQ_DEPTH > ROB_DEPTH || MEMQ_DEPTH > ROB_DEPTH)
@@ -109,6 +118,14 @@ module vortex_ooo_core
   logic [XLEN-1:0] pc;
   logic            fe_wait;    // a branch/JALR is in flight; dispatch is stopped
   logic            halted;     // the tohost store has committed
+
+  // Branch speculation (ADR 0008; unused when SPEC_BRANCHES=0)
+  logic [1:0]      bht        [BHT_ENTRIES];
+  logic            spec_active;              // a predicted branch is unresolved
+  logic [RW-1:0]   br_rob;                   // its ROB index
+  logic [PW-1:0]   ckpt_rat   [NARCH];       // speculative RAT just after it
+  logic [PW-1:0]   ckpt_fl_head;             // free-list head just after it
+  logic            mul_kill, div_kill;       // running op was squashed: drop result
 
   // Physical register file, ready bits, rename tables, free list
   logic [XLEN-1:0] prf        [NUM_PREGS];
@@ -149,6 +166,8 @@ module vortex_ooo_core
   logic            iq_link    [IQ_DEPTH];   // result is pc + 4 (JAL/JALR)
   logic            iq_branch  [IQ_DEPTH];
   logic            iq_jalr    [IQ_DEPTH];
+  logic            iq_spec    [IQ_DEPTH];   // predicted branch (ADR 0008)
+  logic            iq_pred    [IQ_DEPTH];   // its predicted direction
   logic [2:0]      iq_bf3     [IQ_DEPTH];
   logic [2:0]      iq_md_op   [IQ_DEPTH];
   logic            iq_md_word [IQ_DEPTH];
@@ -172,6 +191,8 @@ module vortex_ooo_core
   logic [DBG_CNT_W-1:0] dbg_ooo_completions;
   // Debug: cycles in which two instructions committed (WIDTH=2 proof aid).
   logic [DBG_CNT_W-1:0] dbg_dual_commits;
+  // Debug: predicted branches resolved, and how many of them mispredicted.
+  logic [DBG_CNT_W-1:0] dbg_spec_branches, dbg_mispredicts;
 
   // ---------------------------------------------------------------------------
   // Fetch + decode
@@ -308,12 +329,19 @@ module vortex_ooo_core
   logic d_has_rd, d_is_mem, d_ctrl_wait;
   assign d_has_rd    = reg_we && (rd_addr != '0);
   assign d_is_mem    = is_load || is_store;
-  assign d_ctrl_wait = is_branch || is_jalr;   // stop dispatch until it resolves
+  assign d_ctrl_wait = is_jalr || (is_branch && !SPEC);   // stop dispatch until it resolves
 
   logic d_has_rd1, d_is_mem1, d_ctrl_wait1;
   assign d_has_rd1    = reg_we1 && (rd_addr1 != '0);
   assign d_is_mem1    = is_load1 || is_store1;
-  assign d_ctrl_wait1 = is_branch1 || is_jalr1;
+  assign d_ctrl_wait1 = is_jalr1 || (is_branch1 && !SPEC);
+
+  // Branch prediction at decode: 2-bit counter, predict taken if bit 1 is set.
+  logic d_spec0, d_spec1, pred0, pred1;
+  assign d_spec0 = SPEC && is_branch;
+  assign d_spec1 = SPEC && is_branch1;
+  assign pred0   = bht[pc[BW+1:2]][1];
+  assign pred1   = bht[imem_addr1[BW+1:2]][1];
 
   // ---------------------------------------------------------------------------
   // Rename
@@ -359,8 +387,11 @@ module vortex_ooo_core
     end
   end
 
+  logic squash;   // a predicted branch resolved the other way this cycle
+
   logic dispatch;
-  assign dispatch = !halted && !fe_wait
+  assign dispatch = !halted && !fe_wait && !squash
+                 && !(d_spec0 && spec_active)   // one predicted branch at a time
                  && (rob_count != (RW+1)'(ROB_DEPTH))
                  && iq_has_free
                  && (!d_is_mem || (mq_count != (MW+1)'(MEMQ_DEPTH)))
@@ -379,7 +410,8 @@ module vortex_ooo_core
   assign mq_tail1  = mq_tail + MW'(d_is_mem);
 
   logic dispatch1;
-  assign dispatch1 = DUAL && dispatch && !(is_jal || d_ctrl_wait)
+  assign dispatch1 = DUAL && dispatch && !(is_jal || is_branch || is_jalr)
+                  && !(d_spec1 && spec_active)
                   && (rob_count <= (RW+1)'(ROB_DEPTH - 2))
                   && iq_has_free2
                   && ((mq_count + mq_need) <= (MW+1)'(MEMQ_DEPTH))
@@ -475,7 +507,8 @@ module vortex_ooo_core
   assign br_target   = i_pc + i_imm;
 
   logic redirect;
-  assign redirect = issue && (i_fu == FU_ALU) && (iq_branch[s_idx] || iq_jalr[s_idx]);
+  assign redirect = issue && (i_fu == FU_ALU)
+                 && (iq_jalr[s_idx] || (iq_branch[s_idx] && !iq_spec[s_idx]));
 
   // ---------------------------------------------------------------------------
   // Issue port 1: second ALU / branch unit (WIDTH=2)
@@ -505,7 +538,38 @@ module vortex_ooo_core
   );
 
   logic redirect1;
-  assign redirect1 = issue1 && (iq_branch[s1_idx] || iq_jalr[s1_idx]);
+  assign redirect1 = issue1 && (iq_jalr[s1_idx] || (iq_branch[s1_idx] && !iq_spec[s1_idx]));
+
+  // ---------------------------------------------------------------------------
+  // Predicted-branch resolution (ADR 0008). At most one is in flight, so only
+  // one port can resolve one in a cycle.
+  // ---------------------------------------------------------------------------
+  logic            res0, res1, resolve, res_taken;
+  logic [XLEN-1:0] res_pc, res_imm, squash_pc;
+  assign res0      = issue && (i_fu == FU_ALU) && iq_branch[s_idx] && iq_spec[s_idx];
+  assign res1      = issue1 && iq_branch[s1_idx] && iq_spec[s1_idx];
+  assign resolve   = res0 || res1;
+  assign res_taken = res0 ? br_taken : p1_taken;
+  assign res_pc    = res0 ? i_pc : p1_pc;
+  assign res_imm   = res0 ? i_imm : p1_imm;
+  assign squash    = resolve && (res_taken != (res0 ? iq_pred[s_idx] : iq_pred[s1_idx]));
+  assign squash_pc = res_taken ? (res_pc + res_imm) : (res_pc + INST_BYTES);
+
+  // Squash bookkeeping: what is older than the branch survives.
+  logic [RW-1:0] br_age;
+  assign br_age = br_rob - rob_head;
+
+  // Memory-queue entries older than the branch (a prefix of the queue)
+  logic [MW:0] mq_keep;
+  always_comb begin
+    logic [MW-1:0] idx;
+    mq_keep = '0;
+    for (int i = 0; i < MEMQ_DEPTH; i++) begin
+      idx = mq_head + MW'(i);
+      if (((MW+1)'(i) < mq_count) && ((mq_rob[idx] - rob_head) < br_age))
+        mq_keep = mq_keep + (MW+1)'(1);
+    end
+  end
 
   // ---------------------------------------------------------------------------
   // Xmlacc FU (combinational)
@@ -654,6 +718,7 @@ module vortex_ooo_core
       for (int r = 0; r < NARCH; r++) begin
         spec_rat[r] <= PW'(r);
         arch_rat[r] <= PW'(r);
+        ckpt_rat[r] <= PW'(r);
       end
       fl_head  <= '0;
       fl_tail  <= PW'(NFREE0);
@@ -689,6 +754,8 @@ module vortex_ooo_core
         iq_link[q]    <= 1'b0;
         iq_branch[q]  <= 1'b0;
         iq_jalr[q]    <= 1'b0;
+        iq_spec[q]    <= 1'b0;
+        iq_pred[q]    <= 1'b0;
         iq_bf3[q]     <= '0;
         iq_md_op[q]   <= '0;
         iq_md_word[q] <= 1'b0;
@@ -722,6 +789,14 @@ module vortex_ooo_core
       dbg_mlstat_sat      <= 1'b0;
       dbg_ooo_completions <= '0;
       dbg_dual_commits    <= '0;
+      dbg_spec_branches   <= '0;
+      dbg_mispredicts     <= '0;
+      spec_active         <= 1'b0;
+      br_rob              <= '0;
+      ckpt_fl_head        <= '0;
+      mul_kill            <= 1'b0;
+      div_kill            <= 1'b0;
+      for (int b = 0; b < BHT_ENTRIES; b++) bht[b] <= 2'b01;   // weakly not-taken
       dbg1_retire_valid   <= 1'b0;
       dbg1_retire_pc      <= '0;
       dbg1_wb_valid       <= 1'b0;
@@ -730,11 +805,11 @@ module vortex_ooo_core
     end else begin
       // ---- Dispatch: rename, allocate ROB / IQ / memory-queue entries ----
       if (dispatch) begin
-        if (is_jal) begin
+        if (is_jal || (d_spec0 && pred0)) begin
           pc <= pc + imm;
         end else if (!dispatch1) begin
           pc <= pc + INST_BYTES;
-        end else if (is_jal1) begin
+        end else if (is_jal1 || (d_spec1 && pred1)) begin
           pc <= imem_addr1 + imm1;
         end else begin
           pc <= imem_addr1 + INST_BYTES;
@@ -774,6 +849,8 @@ module vortex_ooo_core
         iq_link[iq_free_idx]    <= (wb_src == WB_PC4);
         iq_branch[iq_free_idx]  <= is_branch;
         iq_jalr[iq_free_idx]    <= is_jalr;
+        iq_spec[iq_free_idx]    <= d_spec0;
+        iq_pred[iq_free_idx]    <= pred0;
         iq_bf3[iq_free_idx]     <= branch_f3;
         iq_md_op[iq_free_idx]   <= md_op;
         iq_md_word[iq_free_idx] <= md_word;
@@ -824,6 +901,8 @@ module vortex_ooo_core
         iq_link[iq_free_idx2]    <= (wb_src1 == WB_PC4);
         iq_branch[iq_free_idx2]  <= is_branch1;
         iq_jalr[iq_free_idx2]    <= is_jalr1;
+        iq_spec[iq_free_idx2]    <= d_spec1;
+        iq_pred[iq_free_idx2]    <= pred1;
         iq_bf3[iq_free_idx2]     <= branch_f3_1;
         iq_md_op[iq_free_idx2]   <= md_op1;
         iq_md_word[iq_free_idx2] <= md_word1;
@@ -897,14 +976,14 @@ module vortex_ooo_core
       end
 
       // ---- Writeback from the multi-cycle units and the load port ----
-      if (mul_done) begin
+      if (mul_done && !mul_kill) begin
         if (mul_has_rd) begin
           prf[mul_dst]        <= mul_result;
           preg_ready[mul_dst] <= 1'b1;
         end
         rob_complete[mul_rob] <= 1'b1;
       end
-      if (div_done) begin
+      if (div_done && !div_kill) begin
         if (div_has_rd) begin
           prf[div_dst]        <= div_result;
           preg_ready[div_dst] <= 1'b1;
@@ -968,6 +1047,74 @@ module vortex_ooo_core
       fl_count  <= fl_count - (PW+1)'(dispatch && d_has_rd) - (PW+1)'(dispatch1 && d_has_rd1)
                             + (PW+1)'(commit && rob_has_rd[rob_head])
                             + (PW+1)'(commit1 && rob_has_rd[rob_head1]);
+
+      // ---- Predicted branches: checkpoint at dispatch, train and resolve ----
+      if (dispatch && d_spec0) begin
+        spec_active  <= 1'b1;
+        br_rob       <= rob_tail;
+        ckpt_fl_head <= fl_head;
+        for (int r = 0; r < NARCH; r++) ckpt_rat[r] <= spec_rat[r];
+      end
+      if (dispatch1 && d_spec1) begin
+        spec_active  <= 1'b1;
+        br_rob       <= rob_tail1;
+        ckpt_fl_head <= fl_head + PW'(d_has_rd);
+        for (int r = 0; r < NARCH; r++)
+          ckpt_rat[r] <= (d_has_rd && (AW'(r) == rd_addr)) ? d_newp : spec_rat[r];
+      end
+      if (resolve) begin
+        spec_active       <= 1'b0;
+        dbg_spec_branches <= dbg_spec_branches + DBG_CNT_W'(1);
+        if (res_taken && (bht[res_pc[BW+1:2]] != 2'b11))
+          bht[res_pc[BW+1:2]] <= bht[res_pc[BW+1:2]] + 2'b01;
+        if (!res_taken && (bht[res_pc[BW+1:2]] != 2'b00))
+          bht[res_pc[BW+1:2]] <= bht[res_pc[BW+1:2]] - 2'b01;
+      end
+
+      // Ops running in the multiplier/divider that the squash makes dead
+      if (mul_start) begin
+        mul_kill <= squash && ((iq_rob[s_idx] - rob_head) > br_age);
+      end else if (squash && mul_busy && ((mul_rob - rob_head) > br_age)) begin
+        mul_kill <= 1'b1;
+      end else if (mul_done) begin
+        mul_kill <= 1'b0;
+      end
+      if (div_start) begin
+        div_kill <= squash && ((iq_rob[s_idx] - rob_head) > br_age);
+      end else if (squash && div_busy && ((div_rob - rob_head) > br_age)) begin
+        div_kill <= 1'b1;
+      end else if (div_done) begin
+        div_kill <= 1'b0;
+      end
+
+      // ---- Mispredict: squash everything younger than the branch ----
+      // Dispatch is held off this cycle, so nothing younger is being allocated.
+      // Writes landing this cycle in squashed pregs are harmless: those pregs go
+      // back to the free list and are re-marked not-ready when reallocated.
+      if (squash) begin
+        dbg_mispredicts <= dbg_mispredicts + DBG_CNT_W'(1);
+        pc      <= squash_pc;
+        fe_wait <= 1'b0;   // any JALR waiting now is younger than the branch
+        for (int r = 0; r < NARCH; r++) spec_rat[r] <= ckpt_rat[r];
+        fl_head   <= ckpt_fl_head;
+        fl_count  <= fl_count + (fl_head - ckpt_fl_head)
+                              + (PW+1)'(commit && rob_has_rd[rob_head])
+                              + (PW+1)'(commit1 && rob_has_rd[rob_head1]);
+        rob_tail  <= br_rob + RW'(1);
+        rob_count <= (RW+1)'(br_age) + (RW+1)'(1) - (RW+1)'(commit) - (RW+1)'(commit1);
+        for (int q = 0; q < IQ_DEPTH; q++) begin
+          if ((iq_rob[q] - rob_head) > br_age) iq_valid[q] <= 1'b0;
+        end
+        // Older entries are a prefix. If the head is younger it may be a load
+        // firing now; then the queue empties behind it.
+        if (mq_keep == '0) begin
+          mq_tail  <= mq_head + MW'(ld_fire || st_fire);
+          mq_count <= '0;
+        end else begin
+          mq_tail  <= mq_head + MW'(mq_keep);
+          mq_count <= mq_keep - (MW+1)'(ld_fire || st_fire);
+        end
+      end
     end
   end
 

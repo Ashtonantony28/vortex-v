@@ -451,6 +451,29 @@ async def xmlacc_rqs_round_overflow(dut):
 # Optional co-simulation against the Python ISS (guarded)
 # ===========================================================================
 @cocotb.test()
+async def mispredict_squashes_waiting_jalr(dut):
+    """A mispredicted branch whose wrong path holds a JALR still waiting on a slow
+    divide: the squash must drop the JALR and release the front end (ADR 0008)."""
+    a = Asm()
+    a.addi(1, 0, 4000)
+    a.addi(2, 0, 3)
+    a.div(5, 1, 2)                   # slow producer of the JALR's base register
+    a.mul(10, 2, 0)                  # x10 = 0, a few cycles late: the wrong path
+                                     # dispatches before the branch can resolve
+    a.beq(10, 0, "target")           # always taken; a cold predictor says not-taken
+    a.jalr(0, 5, 0)                  # wrong path: waits on x5, must be squashed
+    a.addi(6, 0, 99)                 # wrong path
+    a.label("target")
+    a.addi(7, 0, 42)
+    a.add(8, 5, 7)                   # waits for the divide on the right path
+    a.la(31, 0x8000_1000)
+    a.addi(9, 0, 1)
+    a.sw(9, 31, 0)
+    await cosim_lockstep(dut, "mispredict_jalr", a.assemble(), max_cycles=1000,
+                         mem_check=(DATA_BASE, DATA_SIZE))
+
+
+@cocotb.test()
 async def cosim_against_iss(dut):
     """Lockstep co-sim of the RTL against the golden ISS (model/iss/rv64i.py).
 

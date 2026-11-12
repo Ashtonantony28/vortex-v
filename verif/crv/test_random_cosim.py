@@ -90,15 +90,19 @@ if cocotb is not None:
         """Lockstep co-sim of every seed in VORTEX_RANDOM_SEEDS against the ISS."""
         from harness import cosim_lockstep
         seeds = parse_seeds(os.environ.get("VORTEX_RANDOM_SEEDS", DEFAULT_SEEDS))
-        total = 0
+        total = spec = mispredicts = 0
         for seed in seeds:
             asm, data, _ = RandomProgram(seed, n_items=N_ITEMS).build()
             retires, _, _ = await cosim_lockstep(
                 dut, f"seed{seed}", asm.assemble(), data=data,
                 max_cycles=MAX_RTL_CYCLES, mem_check=(DATA_BASE, DATA_SIZE))
             total += len(retires)
+            if hasattr(dut, "dbg_mispredicts"):
+                spec += int(dut.dbg_spec_branches.value)
+                mispredicts += int(dut.dbg_mispredicts.value)
         dut._log.info("random co-sim: %d seeds, %d retired instructions matched the ISS, "
-                      "data region matched", len(seeds), total)
+                      "data region matched; %d predicted branches, %d mispredicts",
+                      len(seeds), total, spec, mispredicts)
 
 
 @pytest.mark.parametrize("toplevel", CORES)
