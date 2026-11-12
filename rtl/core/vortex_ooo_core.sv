@@ -46,8 +46,10 @@ module vortex_ooo_core
   parameter int unsigned      SPEC_BRANCHES = 0, // unresolved predicted branches in flight (0/1)
   parameter int unsigned      BHT_ENTRIES = 64,  // 2-bit branch counters (power of 2)
   parameter int unsigned      LSQ         = 0,   // 1 = loads pass older stores (ADR 0009)
-  parameter int unsigned      XM_LATENCY  = 1    // Xmlacc cycles: 1 = single-cycle port,
+  parameter int unsigned      XM_LATENCY  = 1,   // Xmlacc cycles: 1 = single-cycle port,
                                                  // 2..8 = pipelined unit, own port (ADR 0010)
+  parameter logic [XLEN-1:0]  IO_LIMIT    = 64'h8000_0000  // LSQ: loads below this are device
+                                                 // loads, run only from the queue head (ADR 0011)
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -684,7 +686,8 @@ module vortex_ooo_core
   // the queue has its address. A load fully covered by the youngest overlapping
   // older store takes its bytes from that store; a partial overlap waits for the
   // store to commit. Stores still write only at commit. One load per cycle;
-  // a committing store has the data port first.
+  // a committing store has the data port first. A device load (address below
+  // IO_LIMIT) runs only from the queue head, after every older memory op (ADR 0011).
   // ---------------------------------------------------------------------------
   logic [MEMQ_DEPTH*XLEN-1:0] q_addr, q_data;
   logic [MEMQ_DEPTH*2-1:0]    q_size;
@@ -732,7 +735,8 @@ module vortex_ooo_core
     for (int i = MEMQ_DEPTH - 1; i >= 0; i--) begin
       idx = mq_head + MW'(i);
       if (((MW+1)'(i) < mq_count) && !mq_store[idx] && mq_ready[idx] && !mq_done[idx]
-          && !f_unknown[i] && !f_partial[i] && (f_hit[i] || !st_fire)) begin
+          && !f_unknown[i] && !f_partial[i] && (f_hit[i] || !st_fire)
+          && ((i == 0) || (mq_addr[idx] >= IO_LIMIT))) begin
         lq_found = 1'b1;
         lq_off   = MW'(i);
       end
