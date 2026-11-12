@@ -63,7 +63,8 @@ Options for loads that overlap an older store:
    reference bytes, that a memory read happens only when no older store overlaps, and that it
    never waits on a partial overlap that does not exist. The proof uses yosys
    `sat -prove-asserts` (the unit is combinational, so a SAT proof covers every input) at
-   XLEN=32 with 3 stores. Byte forwarding does not depend on the width. ROB formal stays open.
+   XLEN=32 with 3 stores in CI (about 30 s). Byte forwarding does not depend on the width; a one-off
+   run at XLEN=64 with 4 stores also passed (22 minutes, too slow for CI). ROB formal stays open.
 
 **Verification.**
 - `vortex_ooo_core_lsq` runs the directed tests, ISS co-sim, riscv-tests and the random co-sim,
@@ -88,5 +89,5 @@ Options for loads that overlap an older store:
   store waits for that store to commit. Loads stay in the queue until commit, so the queue fills
   sooner than before. No memory-dependence prediction is needed, because loads never run ahead
   of an older store with an unknown address.
-- **Risk:** the forwarding unit is the first logic proven formally, and only at 32 bits.
+- **Risk:** the forwarding unit is the first logic proven formally, and CI proves it only at 32 bits.
   The ROB property and the cache remain open for M7's follow-on.
