@@ -33,7 +33,7 @@ SOC_CONFIGS = {
     "soc_ooo_full": {"CORE_OOO": 1, "WIDTH": 2, "SPEC_BRANCHES": 1, "LSQ": 1, "XM_LATENCY": 3},
     # block-RAM-style memory (ADR 0012): what the Arty A7 top builds
     "soc_ooo_sync": {"CORE_OOO": 1, "WIDTH": 2, "SPEC_BRANCHES": 1, "LSQ": 1, "XM_LATENCY": 3,
-                     "SYNC_MEM": 1},
+                     "SYNC_MEM": 1, "XM_PORTS": 2},
 }
 
 try:

@@ -9,6 +9,8 @@ failure points at the RTL, not at a malformed program.
 
 Run (from the repo root):  python3 -m pytest verif/crv/ -q
 More seeds:  VORTEX_RANDOM_SEEDS=0-499 python3 -m pytest verif/crv/ -q
+Xmlacc-heavy programs run on the configurations with a pipelined or second Xmlacc
+unit (test_random_cosim_xm_mix), where a squash can land on an op in flight.
 """
 import os
 import sys
@@ -24,9 +26,9 @@ for _p in (str(HERE), str(CORE_DIR), str(ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from cores import CORES, build_and_test  # noqa: E402
+from cores import CORE_CONFIGS, CORES, build_and_test  # noqa: E402
 from rvasm import DATA_BASE, DATA_SIZE, RESET_PC, TOHOST_ADDR  # noqa: E402
-from rvgen import RandomProgram, parse_seeds  # noqa: E402
+from rvgen import MIXES, RandomProgram, parse_seeds  # noqa: E402
 
 DEFAULT_SEEDS = "0-24"           # what CI runs on every core
 N_ITEMS = 180
@@ -35,9 +37,9 @@ MAX_ISS_STEPS = 50_000
 MAX_RTL_CYCLES = 30_000          # ~400 instructions + ~65 cycles per divide
 
 
-def _run_on_iss(seed):
+def _run_on_iss(seed, mix="default"):
     from model.iss.rv64i import Hart, Memory
-    asm, data, stats = RandomProgram(seed, n_items=N_ITEMS).build()
+    asm, data, stats = RandomProgram(seed, n_items=N_ITEMS, mix=MIXES[mix]).build()
     mem = Memory(base=RESET_PC)
     mem.load_words(asm.assemble(), base=RESET_PC)
     for addr, n, v in data:
@@ -58,10 +60,10 @@ def test_generator_is_deterministic():
 
 
 def test_generator_programs_terminate_with_pass_on_iss():
-    for seed in ISS_SEEDS:
-        r, _ = _run_on_iss(seed)
-        assert r["halted"], f"seed {seed}: no tohost halt in {MAX_ISS_STEPS} steps (pc={r['pc']:#x})"
-        assert r["halt_code"] == (True, 0), f"seed {seed}: halt_code={r['halt_code']}"
+    for mix, seed in [(m, s) for m in MIXES for s in ISS_SEEDS]:
+        r, _ = _run_on_iss(seed, mix)
+        assert r["halted"], f"{mix} seed {seed}: no tohost halt in {MAX_ISS_STEPS} steps (pc={r['pc']:#x})"
+        assert r["halt_code"] == (True, 0), f"{mix} seed {seed}: halt_code={r['halt_code']}"
 
 
 def test_generator_covers_every_instruction_class():
@@ -90,9 +92,10 @@ if cocotb is not None:
         """Lockstep co-sim of every seed in VORTEX_RANDOM_SEEDS against the ISS."""
         from harness import cosim_lockstep
         seeds = parse_seeds(os.environ.get("VORTEX_RANDOM_SEEDS", DEFAULT_SEEDS))
+        mix = MIXES[os.environ.get("VORTEX_RANDOM_MIX", "default")]
         total = spec = mispredicts = 0
         for seed in seeds:
-            asm, data, _ = RandomProgram(seed, n_items=N_ITEMS).build()
+            asm, data, _ = RandomProgram(seed, n_items=N_ITEMS, mix=mix).build()
             retires, _, _ = await cosim_lockstep(
                 dut, f"seed{seed}", asm.assemble(), data=data,
                 max_cycles=MAX_RTL_CYCLES, mem_check=(DATA_BASE, DATA_SIZE))
@@ -110,3 +113,15 @@ def test_random_cosim(toplevel):
     build_and_test(toplevel, "test_random_cosim", HERE, extra_pythonpath=[CORE_DIR, ROOT],
                    env={"VORTEX_RANDOM_SEEDS": os.environ.get("VORTEX_RANDOM_SEEDS",
                                                               DEFAULT_SEEDS)})
+
+
+XM_MIX_CORES = [c for c in CORES if CORE_CONFIGS[c][1].get("XM_LATENCY", 1) > 1
+                or CORE_CONFIGS[c][1].get("XM_PORTS", 1) > 1]
+
+
+@pytest.mark.parametrize("toplevel", XM_MIX_CORES)
+def test_random_cosim_xm_mix(toplevel):
+    build_and_test(toplevel, "test_random_cosim", HERE, extra_pythonpath=[CORE_DIR, ROOT],
+                   env={"VORTEX_RANDOM_SEEDS": os.environ.get("VORTEX_RANDOM_SEEDS",
+                                                              DEFAULT_SEEDS),
+                        "VORTEX_RANDOM_MIX": "xm"})

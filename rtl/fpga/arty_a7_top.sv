@@ -16,7 +16,8 @@ module arty_a7_top #(
   parameter int unsigned SPEC_BRANCHES = 1,
   parameter int unsigned LSQ        = 1,
   parameter int unsigned XM_LATENCY = 3,
-  parameter int unsigned SYNC_MEM   = 1             // block RAM (ADR 0012)
+  parameter int unsigned SYNC_MEM   = 1,            // block RAM (ADR 0012)
+  parameter int unsigned XM_PORTS   = 2             // Xmlacc on both issue ports (ADR 0013)
 ) (
   input  logic       CLK100MHZ,
   input  logic       ck_rst,          // active low
@@ -49,6 +50,7 @@ module arty_a7_top #(
     .LSQ           (LSQ),
     .XM_LATENCY    (XM_LATENCY),
     .SYNC_MEM      (SYNC_MEM),
+    .XM_PORTS      (XM_PORTS),
     .CLKS_PER_BIT  (CLKS_PER_BIT),
     .INIT_FILE     (INIT_FILE)
   ) u_soc (

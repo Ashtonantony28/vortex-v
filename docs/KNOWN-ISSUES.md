@@ -71,7 +71,9 @@ correctness failures — the full suite is green — but they're real and owned.
 - **I16 (performance, by design for M8):** Xmlacc issues only on port 0, which it shares with
   loads, multiplies and divides. An int8 matrix-vector kernel reaches about 5.3 MACs/cycle, close
   to the in-order core's 5.2, because port 0 is the bottleneck. A second Xmlacc unit on port 1 is
-  the fix (ADR 0010 follow-on).
+  the fix (ADR 0010 follow-on). **Fixed by `XM_PORTS=2` (ADR 0013):** a second unit on port 1
+  takes the kernel to about 7.6 MACs/cycle. `XM_PORTS` defaults to 1, so this still applies
+  to a default build; the board configuration uses 2.
 - **I17:** the pipelined Xmlacc stages (`XM_LATENCY` > 1) are output registers that rely on
   synthesis retiming. Whether that meets timing on the Arty A7 is unknown until M9.
 
