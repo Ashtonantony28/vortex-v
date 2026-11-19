@@ -163,7 +163,6 @@ module vortex_ooo_core
   logic [PW-1:0]   rob_oldp     [ROB_DEPTH];
   logic            rob_complete [ROB_DEPTH];
   logic            rob_sat      [ROB_DEPTH];
-  logic            rob_illegal  [ROB_DEPTH];
   logic            rob_load     [ROB_DEPTH];   // LSQ: a load, popped from the memq at commit
   logic [RW-1:0]   rob_head, rob_tail;
   logic [RW:0]     rob_count;
@@ -256,6 +255,8 @@ module vortex_ooo_core
   logic             md_word;
   logic             is_xmlacc;
   xmlacc_op_e       xm_op;
+  logic             is_sys;
+  sys_op_e          sys_op;
   logic             dec_illegal;
 
   vortex_decoder #(.XLEN(XLEN)) u_decoder (
@@ -286,6 +287,8 @@ module vortex_ooo_core
     .md_word       (md_word),
     .is_xmlacc     (is_xmlacc),
     .xm_op         (xm_op),
+    .is_sys        (is_sys),
+    .sys_op        (sys_op),
     .illegal       (dec_illegal)
   );
 
@@ -310,6 +313,10 @@ module vortex_ooo_core
   logic             is_xmlacc1;
   xmlacc_op_e       xm_op1;
   logic             dec_illegal1;
+  /* verilator lint_off UNUSEDSIGNAL */   // slot 1 never takes a SYSTEM op
+  sys_op_e          sys_op1;
+  /* verilator lint_on UNUSEDSIGNAL */
+  logic             is_sys1;
 
   vortex_decoder #(.XLEN(XLEN)) u_decoder1 (
     .inst          (inst1),
@@ -339,12 +346,15 @@ module vortex_ooo_core
     .md_word       (md_word1),
     .is_xmlacc     (is_xmlacc1),
     .xm_op         (xm_op1),
+    .is_sys        (is_sys1),
+    .sys_op        (sys_op1),
     .illegal       (dec_illegal1)
   );
 
   // Functional-unit class of a decoded instruction
-  function automatic fu_e fu_class(input logic ld_or_st, input logic md, input md_op_e mop,
-                                   input logic xm);
+  function automatic fu_e fu_class(input logic sys, input logic ld_or_st, input logic md,
+                                   input md_op_e mop, input logic xm);
+    if (sys) return FU_SYS;
     if (ld_or_st) return FU_AGU;
     if (md) begin
       if ((mop == MD_MUL) || (mop == MD_MULH) || (mop == MD_MULHSU) || (mop == MD_MULHU))
@@ -355,14 +365,20 @@ module vortex_ooo_core
     return FU_ALU;
   endfunction
 
+  // SYSTEM, FENCE.I and illegal instructions run alone at the ROB head (ADR 0014).
+  logic d_sys, d_sys1;
+  assign d_sys  = is_sys || dec_illegal;
+  assign d_sys1 = is_sys1 || dec_illegal1;
+
   fu_e d_fu, d_fu1;
-  assign d_fu  = fu_class(is_load || is_store, is_muldiv, md_op, is_xmlacc);
-  assign d_fu1 = fu_class(is_load1 || is_store1, is_muldiv1, md_op1, is_xmlacc1);
+  assign d_fu  = fu_class(d_sys, is_load || is_store, is_muldiv, md_op, is_xmlacc);
+  assign d_fu1 = fu_class(d_sys1, is_load1 || is_store1, is_muldiv1, md_op1, is_xmlacc1);
 
   logic d_has_rd, d_is_mem, d_ctrl_wait;
   assign d_has_rd    = reg_we && (rd_addr != '0);
   assign d_is_mem    = is_load || is_store;
-  assign d_ctrl_wait = is_jalr || (is_branch && !SPEC);   // stop dispatch until it resolves
+  assign d_ctrl_wait = is_jalr || (is_branch && !SPEC)    // stop dispatch until it resolves
+                    || d_sys;
 
   logic d_has_rd1, d_is_mem1, d_ctrl_wait1;
   assign d_has_rd1    = reg_we1 && (rd_addr1 != '0);
@@ -443,7 +459,7 @@ module vortex_ooo_core
   assign mq_tail1  = mq_tail + MW'(d_is_mem);
 
   logic dispatch1;
-  assign dispatch1 = DUAL && dispatch && !(is_jal || is_branch || is_jalr)
+  assign dispatch1 = DUAL && dispatch && !(is_jal || is_branch || is_jalr || d_sys) && !d_sys1
                   && !(d_spec1 && spec_active)
                   && (rob_count <= (RW+1)'(ROB_DEPTH - 2))
                   && iq_has_free2
@@ -491,6 +507,7 @@ module vortex_ooo_core
       unique case (fu_e'(iq_fu[i]))
         FU_MUL : fu_ok = !mul_busy;
         FU_DIV : fu_ok = !div_busy;
+        FU_SYS : fu_ok = (iq_rob[i] == rob_head);   // oldest in flight (ADR 0014)
         default: fu_ok = 1'b1;
       endcase
       age = iq_rob[i] - rob_head;
@@ -541,9 +558,45 @@ module vortex_ooo_core
   assign jalr_target = (op1 + i_imm) & ~XLEN'(1);   // LSB cleared per spec
   assign br_target   = i_pc + i_imm;
 
+  // ---------------------------------------------------------------------------
+  // CSR file, traps and MRET (ADR 0014). A SYSTEM / FENCE.I / illegal op stops
+  // dispatch behind it and issues on port 0 only as the ROB head, so it is the
+  // only instruction in flight. Its encoding is held in sys_* from dispatch.
+  // ---------------------------------------------------------------------------
+  logic            sys_fire, csr_redirect, csr_no_count, sat_set;
+  logic [XLEN-1:0] csr_rdata, csr_target;
+  logic [31:0]     sys_inst;
+  logic            sys_illegal, sys_skip;
+  sys_op_e         sys_op_r;
+  logic [1:0]      retire_cnt;
+  assign sys_fire = issue && (i_fu == FU_SYS);
+  // The SYS op commits the cycle after it fires; a trap or a minstret write
+  // keeps it out of minstret (sys_skip). Nothing else commits in that cycle.
+  assign retire_cnt = 2'(commit) + 2'(commit1) - 2'(commit && sys_skip);
+  assign sat_set    = (commit && rob_sat[rob_head]) || (commit1 && rob_sat[rob_head1]);
+
+  vortex_csr #(.XLEN(XLEN)) u_csr (
+    .clk        (clk),
+    .rst_n      (rst_n),
+    .exec       (sys_fire),
+    .illegal    (sys_illegal),
+    .op         (sys_op_r),
+    .inst       (sys_inst),
+    .rs1_val    (op1),
+    .pc         (i_pc),
+    .rdata      (csr_rdata),
+    .redirect   (csr_redirect),
+    .target     (csr_target),
+    .no_count   (csr_no_count),
+    .retire_cnt (retire_cnt),
+    .sat_set    (sat_set),
+    .mlstat_sat (dbg_mlstat_sat)
+  );
+
   logic redirect;
-  assign redirect = issue && (i_fu == FU_ALU)
-                 && (iq_jalr[s_idx] || (iq_branch[s_idx] && !iq_spec[s_idx]));
+  assign redirect = (issue && (i_fu == FU_ALU)
+                     && (iq_jalr[s_idx] || (iq_branch[s_idx] && !iq_spec[s_idx])))
+                 || sys_fire;
 
   // ---------------------------------------------------------------------------
   // Issue port 1: second ALU / branch unit (WIDTH=2)
@@ -645,8 +698,8 @@ module vortex_ooo_core
   logic            sc_fire;
   logic [XLEN-1:0] sc_data;
   logic            sc_sat;
-  assign sc_fire = issue && ((i_fu == FU_ALU) || (!XMP && (i_fu == FU_XM)));
-  assign sc_data = (i_fu == FU_XM) ? xm_result : alu_res;
+  assign sc_fire = issue && ((i_fu == FU_ALU) || (i_fu == FU_SYS) || (!XMP && (i_fu == FU_XM)));
+  assign sc_data = (i_fu == FU_XM) ? xm_result : (i_fu == FU_SYS) ? csr_rdata : alu_res;
   assign sc_sat  = (i_fu == FU_XM) && xm_rqs_sat;
 
   // Port 1 single-cycle result: the ALU, or the second Xmlacc unit at XM_LATENCY=1.
@@ -921,8 +974,9 @@ module vortex_ooo_core
     end
     // Fall-through pc + 4 was set at dispatch; only a taken branch or JALR moves it.
     if (redirect) begin
-      if (iq_jalr[s_idx])  pc_n = jalr_target;
-      else if (br_taken)   pc_n = br_target;
+      if (sys_fire)            begin if (csr_redirect) pc_n = csr_target; end
+      else if (iq_jalr[s_idx]) pc_n = jalr_target;
+      else if (br_taken)       pc_n = br_target;
     end
     // At most one branch/JALR is ever in flight, so redirect and redirect1
     // never fire together.
@@ -962,7 +1016,6 @@ module vortex_ooo_core
         rob_oldp[e]     <= '0;
         rob_complete[e] <= 1'b0;
         rob_sat[e]      <= 1'b0;
-        rob_illegal[e]  <= 1'b0;
         rob_load[e]     <= 1'b0;
       end
       rob_head  <= '0;
@@ -1019,7 +1072,10 @@ module vortex_ooo_core
       dbg_wb_valid        <= 1'b0;
       dbg_wb_rd           <= '0;
       dbg_wb_data         <= '0;
-      dbg_mlstat_sat      <= 1'b0;
+      sys_inst            <= '0;
+      sys_illegal         <= 1'b0;
+      sys_op_r            <= SYS_CSR;
+      sys_skip            <= 1'b0;
       dbg_ooo_completions <= '0;
       dbg_dual_commits    <= '0;
       dbg_spec_branches   <= '0;
@@ -1067,7 +1123,6 @@ module vortex_ooo_core
         rob_oldp[rob_tail]     <= d_oldp;
         rob_complete[rob_tail] <= 1'b0;
         rob_sat[rob_tail]      <= 1'b0;
-        rob_illegal[rob_tail]  <= dec_illegal;
         rob_load[rob_tail]     <= is_load;
         rob_tail               <= rob_tail + RW'(1) + RW'(dispatch1);
 
@@ -1122,7 +1177,6 @@ module vortex_ooo_core
         rob_oldp[rob_tail1]     <= d_oldp1;
         rob_complete[rob_tail1] <= 1'b0;
         rob_sat[rob_tail1]      <= 1'b0;
-        rob_illegal[rob_tail1]  <= dec_illegal1;
         rob_load[rob_tail1]     <= is_load1;
 
         iq_valid[iq_free_idx2]   <= 1'b1;
@@ -1160,6 +1214,15 @@ module vortex_ooo_core
           mq_has_rd[mq_tail1] <= d_has_rd1;
         end
       end
+
+      // ---- SYSTEM op bookkeeping (ADR 0014) ----
+      if (dispatch && d_sys) begin
+        sys_inst    <= inst;
+        sys_illegal <= dec_illegal;
+        sys_op_r    <= sys_op;
+      end
+      if (sys_fire)    sys_skip <= csr_no_count;
+      else if (commit) sys_skip <= 1'b0;
 
       // ---- Issue / execute ----
       if (issue) begin
@@ -1296,7 +1359,6 @@ module vortex_ooo_core
         dbg_wb_valid     <= rob_has_rd[rob_head];
         dbg_wb_rd        <= rob_rd[rob_head];
         dbg_wb_data      <= rob_has_rd[rob_head] ? commit_data : '0;
-        if (rob_sat[rob_head]) dbg_mlstat_sat <= 1'b1;
         if (tohost_commit) halted <= 1'b1;
       end else begin
         dbg_retire_valid <= 1'b0;
@@ -1312,7 +1374,6 @@ module vortex_ooo_core
         dbg1_wb_valid     <= rob_has_rd[rob_head1];
         dbg1_wb_rd        <= rob_rd[rob_head1];
         dbg1_wb_data      <= rob_has_rd[rob_head1] ? commit_data1 : '0;
-        if (rob_sat[rob_head1]) dbg_mlstat_sat <= 1'b1;
         dbg_dual_commits  <= dbg_dual_commits + DBG_CNT_W'(1);
       end else begin
         dbg1_retire_valid <= 1'b0;
@@ -1405,14 +1466,6 @@ module vortex_ooo_core
   // ---------------------------------------------------------------------------
   // verilator lint_off BLKSEQ
   always @(posedge clk) begin
-    if (commit && rob_illegal[rob_head]) begin
-      $display("[vortex_ooo_core] WARNING: illegal/unsupported instruction at pc=%016h",
-               rob_pc[rob_head]);
-    end
-    if (commit1 && rob_illegal[rob_head1]) begin
-      $display("[vortex_ooo_core] WARNING: illegal/unsupported instruction at pc=%016h",
-               rob_pc[rob_head1]);
-    end
     // With nothing in flight the speculative and committed maps must agree.
     if (rob_count == '0) begin
       for (int r = 0; r < NARCH; r++) begin

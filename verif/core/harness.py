@@ -229,7 +229,7 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
     if data:
         for addr, nbytes, val in data:
             mem_iss.store(addr, nbytes, val)
-    iss = iss_mod.Hart(mem=mem_iss, reset_pc=RESET_PC, tohost_addr=TOHOST_ADDR)
+    iss = iss_mod.Hart(mem=mem_iss, reset_pc=RESET_PC, tohost_addr=TOHOST_ADDR, traps=True)
 
     retires, mem_rtl, state = await run_program(dut, words, max_cycles=max_cycles, data=data)
     assert state["tohost"] == 1, f"{name}: RTL tohost={state['tohost']} (expected PASS=1)"
@@ -237,6 +237,9 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
     for i, rtl_rec in enumerate(retires):
         assert not iss.halted, \
             f"{name}[{i}]: RTL retired pc={rtl_rec['pc']:#x} after the tohost store"
+        # mcycle/cycle reads are taken from the RTL; the ISS cannot predict them
+        # (ADR 0014). The override is used only by an instruction that reads them.
+        iss.cycle_override = rtl_rec["data"]
         rec = iss.step()
         iss_pc = rec["pc"] & MASK64
         iss_rd = rec.get("rd")

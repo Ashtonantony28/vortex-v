@@ -14,7 +14,7 @@ from pathlib import Path
 SW = Path(__file__).resolve().parent
 GCC = "riscv64-unknown-elf-gcc"
 OBJCOPY = "riscv64-unknown-elf-objcopy"
-CFLAGS = ["-march=rv64im", "-mabi=lp64", "-mcmodel=medany", "-O2", "-ffreestanding",
+CFLAGS = ["-march=rv64im_zicsr_zifencei", "-mabi=lp64", "-mcmodel=medany", "-O2", "-ffreestanding",
           "-fno-builtin", "-nostdlib", "-nostartfiles", "-static", "-Wall", "-Werror",
           "-Wl,--no-warn-rwx-segments"]
 RAM_BASE = 0x8000_0000

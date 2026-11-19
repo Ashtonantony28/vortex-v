@@ -7,8 +7,8 @@
 // Correctness-first baseline before the OoO engine (see CLAUDE.md prime
 // directive #3 and docs/M1-INTERFACE-v1.md).
 //
-// Scope: RV64I base integer only (incl. the RV64 *W ops). No M/C/CSR extensions,
-// no traps/interrupts beyond the tohost-store halt.
+// Scope: RV64IM + Xmlacc, Zicsr with the machine-mode CSRs, and ecall/ebreak/
+// illegal-instruction traps and mret (ADR 0014). No C extension, no interrupts.
 //
 // Memory contract (per M1-INTERFACE-v1.md):
 //   - imem: combinational read, 32-bit aligned instruction at imem_addr.
@@ -48,9 +48,8 @@ module vortex_core
   output logic [4:0]        dbg_wb_rd,
   output logic [XLEN-1:0]   dbg_wb_data,
 
-  // Xmlacc mlstat.SAT sticky (CSR 0x801 bit0). Full Zicsr CSR-instruction
-  // plumbing is deferred past M3 (see header); the sticky SAT state is exposed
-  // here so the co-sim can check requantize saturation against the ISS.
+  // Xmlacc mlstat.SAT sticky (CSR 0x801 bit 0), so the co-sim can check
+  // requantize saturation against the ISS at the end of a run.
   output logic              dbg_mlstat_sat
 );
 
@@ -89,6 +88,8 @@ module vortex_core
   logic             md_word;
   logic             is_xmlacc;
   xmlacc_op_e       xm_op;
+  logic             is_sys;
+  sys_op_e          sys_op;
   logic             dec_illegal;
   // Source-use flags drive renaming in vortex_ooo_core; the in-order core reads
   // the register file unconditionally, so it leaves them unused.
@@ -124,6 +125,8 @@ module vortex_core
     .md_word       (md_word),
     .is_xmlacc     (is_xmlacc),
     .xm_op         (xm_op),
+    .is_sys        (is_sys),
+    .sys_op        (sys_op),
     .illegal       (dec_illegal)
   );
 
@@ -218,6 +221,34 @@ module vortex_core
   );
 
   // ---------------------------------------------------------------------------
+  // CSR file, traps and MRET (ADR 0014). A single-cycle core runs a SYSTEM or
+  // illegal instruction like any other: every older one has retired.
+  // ---------------------------------------------------------------------------
+  logic            retiring, csr_exec, csr_redirect, csr_no_count, sat_set;
+  logic [XLEN-1:0] csr_rdata, csr_target;
+  assign retiring = running && !md_stall;
+  assign csr_exec = retiring && (is_sys || dec_illegal);
+  assign sat_set  = retiring && is_xmlacc && (xm_op == XM_RQS) && xm_sat;
+
+  vortex_csr #(.XLEN(XLEN)) u_csr (
+    .clk        (clk),
+    .rst_n      (rst_n),
+    .exec       (csr_exec),
+    .illegal    (dec_illegal),
+    .op         (sys_op),
+    .inst       (inst),
+    .rs1_val    (rs1_data),
+    .pc         (pc),
+    .rdata      (csr_rdata),
+    .redirect   (csr_redirect),
+    .target     (csr_target),
+    .no_count   (csr_no_count),
+    .retire_cnt (2'(retiring && !csr_no_count)),
+    .sat_set    (sat_set),
+    .mlstat_sat (dbg_mlstat_sat)
+  );
+
+  // ---------------------------------------------------------------------------
   // Next-PC selection
   // ---------------------------------------------------------------------------
   logic [XLEN-1:0] pc_plus4, jalr_target, next_pc;
@@ -225,7 +256,9 @@ module vortex_core
   assign jalr_target = (rs1_data + imm) & ~64'd1; // LSB cleared per spec
 
   always_comb begin
-    if (is_jal) begin
+    if (csr_redirect) begin
+      next_pc = csr_target;                       // trap -> mtvec, mret -> mepc
+    end else if (is_jal) begin
       next_pc = pc + imm;
     end else if (is_jalr) begin
       next_pc = jalr_target;
@@ -266,6 +299,7 @@ module vortex_core
       WB_XMLACC: wb_data = xm_result;
       default  : wb_data = alu_y;
     endcase
+    if (is_sys) wb_data = csr_rdata;            // CSR ops: the old CSR value
   end
 
   // Actual architectural register write enable (x0 handled in regfile).
@@ -288,7 +322,6 @@ module vortex_core
       dbg_wb_valid     <= 1'b0;
       dbg_wb_rd        <= '0;
       dbg_wb_data      <= '0;
-      dbg_mlstat_sat   <= 1'b0;
     end else if (halted) begin
       dbg_retire_valid <= 1'b0;
       dbg_wb_valid     <= 1'b0;
@@ -306,29 +339,11 @@ module vortex_core
       dbg_wb_valid     <= reg_we && (rd_addr != 5'd0);
       dbg_wb_rd        <= rd_addr;
       dbg_wb_data      <= (reg_we && (rd_addr != 5'd0)) ? wb_data : '0;
-      // mlstat.SAT sticky: set (never cleared here — W1C is a deferred CSR op)
-      // when a retiring mlacc.rqs saturates.
-      if (is_xmlacc && (xm_op == XM_RQS) && xm_sat) begin
-        dbg_mlstat_sat <= 1'b1;
-      end
       if (tohost_store) begin
         halted <= 1'b1;
       end
     end
   end
-
-  // ---------------------------------------------------------------------------
-  // Simulation-only sanity note (keeps dec_illegal "used"; ignored by synthesis)
-  // ---------------------------------------------------------------------------
-  // verilator lint_off BLKSEQ
-  always @(posedge clk) begin
-    if (running && dec_illegal) begin
-      // RV64I scope only; illegal/unsupported encodings are not expected in M1.
-      $display("[vortex_core] WARNING: illegal/unsupported instruction %08h at pc=%016h",
-               inst, pc);
-    end
-  end
-  // verilator lint_on BLKSEQ
 
 endmodule : vortex_core
 `endif

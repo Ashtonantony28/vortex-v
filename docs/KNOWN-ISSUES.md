@@ -88,3 +88,19 @@ correctness failures — the full suite is green — but they're real and owned.
   50 MHz target) and the pin constraints are unchecked until the first Vivado run.
 - **I20:** the UART has no receiver, and device reads must have no side effects: with
   `SPEC_BRANCHES=1` a device load at the memory-queue head can still be on a wrong path.
+
+## Zicsr and traps (ADR 0014)
+- **I21:** machine mode only, and no interrupts: `mie`/`mip` read as 0 and `wfi` is a no-op.
+  Misaligned loads and stores neither work nor trap (riscv-tests `ma_data` stays excluded), and a
+  jump to a target that is not 4-byte aligned does not trap.
+- **I22 (verification gap):** `mcycle`/`cycle` reads are not checked against the ISS; the co-sim
+  hands the ISS the RTL's value. A CSRRS/CSRRC that *writes* `mcycle` with a non-zero mask
+  depends on that value too, so the random programs never generate one.
+- **I23 (performance, by design):** every CSR access, `fence.i` and trap drains the out-of-order
+  pipeline first (it issues only as the oldest instruction). Fine for occasional `rdcycle`; a
+  loop that polls a CSR runs at in-order speed or worse.
+- **I24 (simulator):** Icarus shares a function's argument storage between callers, so a package
+  function called from `always_comb` in two instances of a module can make the two blocks
+  retrigger each other forever (seen with `csr_legal` in the two decoders). Call such functions
+  from a continuous assignment instead.
+

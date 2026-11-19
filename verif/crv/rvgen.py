@@ -38,17 +38,22 @@ LOADS = {"lb": 1, "lh": 2, "lw": 4, "ld": 8, "lbu": 1, "lhu": 2, "lwu": 4}
 STORES = {"sb": 1, "sh": 2, "sw": 4, "sd": 8}
 BRANCHES = ["beq", "bne", "blt", "bge", "bltu", "bgeu"]
 
+CSR_MSCRATCH, CSR_MLSTAT = 0x340, 0x801
+# CSRs the random programs read (ADR 0014): mscratch, minstret, instret, mlstat,
+# mcycle, cycle, misa, mhartid.
+CSR_READS = [0x340, 0xB02, 0xC02, 0x801, 0xB00, 0xC00, 0x301, 0xF14]
+
 # Relative weights of each kind of item in the program body.
 DEFAULT_MIX = {
     "alu_rr": 18, "alu_ri": 12, "shift": 8, "upper": 3, "muldiv": 10, "xmlacc": 10,
-    "load": 12, "store": 9, "branch": 7, "jal": 2, "jalr": 2, "loop": 3,
+    "load": 12, "store": 9, "branch": 7, "jal": 2, "jalr": 2, "loop": 3, "csr": 2,
 }
 
 # Xmlacc-heavy mix: dense maccs around mispredicting branches, so the Xmlacc
 # pipelines (ADR 0010) and the second unit (ADR 0013) see squashes mid-flight.
 XM_MIX = {
     "alu_rr": 10, "alu_ri": 6, "shift": 2, "upper": 1, "muldiv": 2, "xmlacc": 30,
-    "load": 6, "store": 4, "branch": 14, "jal": 1, "jalr": 1, "loop": 3,
+    "load": 6, "store": 4, "branch": 14, "jal": 1, "jalr": 1, "loop": 3, "csr": 2,
 }
 MIXES = {"default": DEFAULT_MIX, "xm": XM_MIX}
 
@@ -111,7 +116,7 @@ class RandomProgram:
 
     # -- emitters for one "simple" instruction (no control flow) ----------
     def _emit_simple(self, a, allow_mem=True):
-        kinds = ["alu_rr", "alu_ri", "shift", "upper", "muldiv", "xmlacc"]
+        kinds = ["alu_rr", "alu_ri", "shift", "upper", "muldiv", "xmlacc", "csr"]
         if allow_mem:
             kinds += ["load", "store"]
         weights = [self.mix[k] for k in kinds]
@@ -144,6 +149,26 @@ class RandomProgram:
                 op = rng.choice(XMLACC_RR)
                 self.stats[op] += 1
                 getattr(a, op)(self._dst(), self._src(), self._src())
+        elif kind == "csr":
+            # ADR 0014. Serializing on the out-of-order core. mcycle/cycle are
+            # only read with rs1 = x0: the harness hands the ISS the RTL's value.
+            r = rng.random()
+            if r < 0.35:
+                op = "csr_read"
+                a.csrr(self._dst(), rng.choice(CSR_READS))
+            elif r < 0.65:
+                op = rng.choice(["csrrw", "csrrs", "csrrc"])
+                getattr(a, op)(self._dst(), CSR_MSCRATCH, self._src())
+            elif r < 0.8:
+                op = rng.choice(["csrrwi", "csrrsi", "csrrci"])
+                getattr(a, op)(self._dst(), CSR_MSCRATCH, rng.randint(0, 31))
+            elif r < 0.9:
+                op = "mlstat_clear"                 # W1C
+                a.csrrw(self._dst(), CSR_MLSTAT, self._src())
+            else:
+                op = "fence"
+                a.fence()
+            self.stats[op] += 1
         elif kind == "load":
             op, size = rng.choice(list(LOADS.items()))
             off = self._mem_off(size, is_store=False)

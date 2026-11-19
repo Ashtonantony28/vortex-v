@@ -6,9 +6,9 @@ a store to `tohost` (1 = pass, (n<<1)|1 = test case n failed). That makes them a
 oracle independent of our own ISS: the RTL<->ISS co-sim can't catch a spec
 misreading that both share, but these can.
 
-We supply a CSR-free environment (verif/conformance/rvtest_env/) because the core has
-no Zicsr/traps yet. Tests that genuinely need those are listed in EXCLUDED with
-the reason; test_inventory_is_complete fails if any upstream test is neither run
+We supply a CSR-free environment (verif/conformance/rvtest_env/): the upstream one
+needs the riscv-tests env/ submodule, which is not vendored. Tests that cannot run
+are listed in EXCLUDED with the reason; test_inventory_is_complete fails if any upstream test is neither run
 nor explicitly excluded, so nothing can drop out silently.
 
 Run (from the repo root):  python3 -m pytest verif/conformance/ -q
@@ -44,8 +44,6 @@ from cores import CORES  # noqa: E402
 
 # Tests not run, with the reason. Revisit each when its prerequisite lands.
 EXCLUDED = {
-    "rv64ui-fence_i": "needs Zicsr (csrr/csrw) and fence.i with instruction-memory "
-                      "coherence; the core has neither yet (M1.1 follow-up)",
     "rv64ui-ma_data": "misaligned load/store: the spec allows either hardware support "
                       "or a trap, and the core implements neither yet",
 }
@@ -82,7 +80,7 @@ def _build(name):
     elf = BUILD_DIR / f"{name}.elf"
     binf = BUILD_DIR / f"{name}.bin"
     subprocess.run(
-        [GCC, "-march=rv64im", "-mabi=lp64", "-static", "-mcmodel=medany",
+        [GCC, "-march=rv64im_zicsr_zifencei", "-mabi=lp64", "-static", "-mcmodel=medany",
          "-nostdlib", "-nostartfiles", "-Wl,--no-warn-rwx-segments",
          f"-I{ENV_DIR}", f"-I{TESTS_SRC / 'macros' / 'scalar'}",
          f"-T{ENV_DIR / 'link.ld'}", str(src), "-o", str(elf)],

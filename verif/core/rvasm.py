@@ -92,6 +92,7 @@ OPC_LOAD, OPC_OPIMM, OPC_AUIPC, OPC_OPIMMW = 0x03, 0x13, 0x17, 0x1B
 OPC_STORE, OPC_OP, OPC_LUI, OPC_OPW = 0x23, 0x33, 0x37, 0x3B
 OPC_BRANCH, OPC_JALR, OPC_JAL = 0x63, 0x67, 0x6F
 OPC_CUSTOM0 = 0x0B   # Xmlacc Tier-1 ML ops
+OPC_MISCMEM, OPC_SYSTEM = 0x0F, 0x73
 
 
 def _enc_r4(rs3, funct2, rs2, rs1, funct3, rd, opcode):
@@ -217,6 +218,26 @@ class Asm:
     def dot8su(self, rd, rs1, rs2): return self._emit(lambda pc, L: _enc_r(0x00, rs2, rs1, 0x2, rd, OPC_CUSTOM0))
     def macc(self, rd, rs1, rs2, rs3): return self._emit(lambda pc, L: _enc_r4(rs3, 0x0, rs2, rs1, 0x4, rd, OPC_CUSTOM0))
     def rqs(self, rd, rs1, rs2):    return self._emit(lambda pc, L: _enc_r(0x00, rs2, rs1, 0x5, rd, OPC_CUSTOM0))
+
+    # Zicsr and SYSTEM (ADR 0014). `csr` is the 12-bit CSR address.
+    def _csr(self, f3, rd, csr, rs1):
+        return self._emit(lambda pc, L: ((csr & 0xFFF) << 20) | ((rs1 & 0x1F) << 15)
+                          | (f3 << 12) | ((rd & 0x1F) << 7) | OPC_SYSTEM)
+    def csrrw(self, rd, csr, rs1):    return self._csr(0x1, rd, csr, rs1)
+    def csrrs(self, rd, csr, rs1):    return self._csr(0x2, rd, csr, rs1)
+    def csrrc(self, rd, csr, rs1):    return self._csr(0x3, rd, csr, rs1)
+    def csrrwi(self, rd, csr, zimm):  return self._csr(0x5, rd, csr, zimm)
+    def csrrsi(self, rd, csr, zimm):  return self._csr(0x6, rd, csr, zimm)
+    def csrrci(self, rd, csr, zimm):  return self._csr(0x7, rd, csr, zimm)
+    def csrr(self, rd, csr):          return self.csrrs(rd, csr, 0)
+    def csrw(self, csr, rs1):         return self.csrrw(0, csr, rs1)
+    def ecall(self):                  return self._emit(lambda pc, L: 0x00000073)
+    def ebreak(self):                 return self._emit(lambda pc, L: 0x00100073)
+    def mret(self):                   return self._emit(lambda pc, L: 0x30200073)
+    def wfi(self):                    return self._emit(lambda pc, L: 0x10500073)
+    def fence(self):                  return self._emit(lambda pc, L: 0x0FF0000F)
+    def fence_i(self):                return self._emit(lambda pc, L: 0x0000100F)
+    def word(self, w):                return self._emit(lambda pc, L: w & 0xFFFFFFFF)
 
     def la(self, rd, target):
         """Load a 64-bit absolute address (PC-relative via AUIPC+ADDI).

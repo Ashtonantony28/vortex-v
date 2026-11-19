@@ -48,8 +48,9 @@ module vortex_decoder
 
   output logic                 is_xmlacc,  // Xmlacc op -> route to the ML unit
   output vortex_pkg::xmlacc_op_e xm_op,    // which Xmlacc op (= funct3)
-
-  output logic                 illegal
+  output logic                 is_sys,     // SYSTEM op or FENCE.I -> the CSR file (ADR 0014)
+  output vortex_pkg::sys_op_e  sys_op,
+  output logic                 illegal     // traps; all other side-effect flags are cleared
 );
 
   logic [6:0] opcode;
@@ -64,7 +65,10 @@ module vortex_decoder
   assign rs3_addr = inst[31:27];   // R4-type rs3 field (harmless for other fmts)
   assign rd_addr  = inst[11:7];
 
-  assign use_rs1 = !((opcode == OPC_LUI) || (opcode == OPC_AUIPC) || (opcode == OPC_JAL));
+  // CSR immediate forms and ECALL..WFI use the rs1 field as an immediate or not at all.
+  assign use_rs1 = !((opcode == OPC_LUI) || (opcode == OPC_AUIPC) || (opcode == OPC_JAL)
+                  || (opcode == OPC_MISC_MEM)
+                  || ((opcode == OPC_SYSTEM) && (funct3[2] || (funct3 == F3_PRIV))));
   assign use_rs2 = (opcode == OPC_OP) || (opcode == OPC_OP_W) || (opcode == OPC_STORE)
                 || (opcode == OPC_BRANCH) || (opcode == OPC_CUSTOM0);
   assign use_rs3 = (opcode == OPC_CUSTOM0) && (funct3 == F3_MACC);
@@ -76,6 +80,12 @@ module vortex_decoder
   assign imm_b = {{(XLEN-13){inst[31]}}, inst[31], inst[7], inst[30:25], inst[11:8], 1'b0};
   assign imm_u = {{(XLEN-32){inst[31]}}, inst[31:12], 12'b0};
   assign imm_j = {{(XLEN-21){inst[31]}}, inst[31], inst[19:12], inst[20], inst[30:21], 1'b0};
+
+  // CSR access check (ADR 0014). A continuous assign, not a call inside the
+  // always_comb below: Icarus shares a function's argument storage between
+  // callers, so two decoders calling it from always_comb retrigger each other.
+  logic csr_ok;
+  assign csr_ok = csr_legal(inst[31:20], (funct3[1:0] == CSR_OP_RW) || (rs1_addr != 5'd0));
 
   // shift-type flag (SRA vs SRL / SUB vs ADD) lives in funct7 bit 30 of inst
   logic alt_op; // inst[30]: 1 => SUB / SRA
@@ -102,6 +112,8 @@ module vortex_decoder
     md_word       = 1'b0;
     is_xmlacc     = 1'b0;
     xm_op         = xmlacc_op_e'(funct3);
+    is_sys        = 1'b0;
+    sys_op        = SYS_CSR;
     illegal       = 1'b0;
 
     unique case (opcode)
@@ -237,7 +249,9 @@ module vortex_decoder
             F3_AND    : alu_op = ALU_AND;
             default   : illegal = 1'b1;
           endcase
-          if (!((funct7 == 7'b0000000) || (funct7 == 7'b0100000)))
+          // funct7 0100000 is SUB/SRA (SUBW/SRAW) only.
+          if (!((funct7 == 7'b0000000)
+                || ((funct7 == 7'b0100000) && ((funct3 == F3_ADD_SUB) || (funct3 == F3_SR)))))
             illegal = 1'b1;
         end
       end
@@ -285,7 +299,9 @@ module vortex_decoder
             F3_SR     : alu_op = alu_op_e'(alt_op ? ALU_SRAW : ALU_SRLW);
             default   : illegal = 1'b1;
           endcase
-          if (!((funct7 == 7'b0000000) || (funct7 == 7'b0100000)))
+          // funct7 0100000 is SUB/SRA (SUBW/SRAW) only.
+          if (!((funct7 == 7'b0000000)
+                || ((funct7 == 7'b0100000) && ((funct3 == F3_ADD_SUB) || (funct3 == F3_SR)))))
             illegal = 1'b1;
         end
       end
@@ -310,8 +326,51 @@ module vortex_decoder
         endcase
       end
 
+      // ---- MISC-MEM: FENCE is a no-op (memory is kept in order for one hart);
+      //      FENCE.I serializes so younger instructions are fetched after it ----
+      OPC_MISC_MEM: begin
+        if (funct3 == F3_FENCEI) begin
+          is_sys = 1'b1;
+          sys_op = SYS_FENCEI;
+        end else if (funct3 != F3_FENCE) begin
+          illegal = 1'b1;
+        end
+      end
+
+      // ---- SYSTEM (ADR 0014) ----
+      OPC_SYSTEM: begin
+        is_sys = 1'b1;
+        if (funct3 == F3_PRIV) begin
+          if (inst == INST_ECALL)       sys_op = SYS_ECALL;
+          else if (inst == INST_EBREAK) sys_op = SYS_EBREAK;
+          else if (inst == INST_MRET)   sys_op = SYS_MRET;
+          else if (inst == INST_WFI)    sys_op = SYS_WFI;
+          else                          illegal = 1'b1;
+        end else if (funct3[1:0] == 2'b00) begin
+          illegal = 1'b1;                                // funct3 = 100 is reserved
+        end else begin
+          sys_op = SYS_CSR;
+          reg_we = 1'b1;
+          // CSRRW always writes; CSRRS/CSRRC write only for a non-zero rs1/zimm field.
+          if (!csr_ok) illegal = 1'b1;
+        end
+      end
+
       default: illegal = 1'b1;
     endcase
+
+    // An illegal instruction only traps: no register write, memory access or jump.
+    if (illegal) begin
+      reg_we    = 1'b0;
+      is_load   = 1'b0;
+      is_store  = 1'b0;
+      is_branch = 1'b0;
+      is_jal    = 1'b0;
+      is_jalr   = 1'b0;
+      is_muldiv = 1'b0;
+      is_xmlacc = 1'b0;
+      is_sys    = 1'b0;
+    end
   end
 
 endmodule : vortex_decoder

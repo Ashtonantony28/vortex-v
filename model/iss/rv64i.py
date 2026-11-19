@@ -11,11 +11,12 @@ RV64 core.  Implements the RV64I base integer ISA plus the RV64M extension:
       MULW DIVW DIVUW REMW REMUW (32-bit, OP-32, funct7=0000001)
     Division-by-zero and signed-overflow follow the RISC-V spec (no traps).
   * FENCE / FENCE.I treated as no-ops
-  * ECALL sets a halted flag
+  * ECALL sets a halted flag (default), or with traps=True (ADR 0014):
+    Zicsr with the machine-mode CSRs, and ecall/ebreak/illegal-instruction
+    traps to mtvec, mret and wfi
   * a store to TOHOST_ADDR (0x8000_1000) halts the run (value 1 == PASS)
 
-No C (compressed) extension, no CSRs beyond the trivial ecall-halt, no
-traps/interrupts.  Dependency-light: numpy is NOT required.
+No C (compressed) extension, no interrupts, no misaligned-access traps.  Dependency-light: numpy is NOT required.
 
 Frozen contract: docs/M1-INTERFACE-v1.md, section "Golden model contract".
 RV64M is the M1.1 follow-up named as out-of-scope by the frozen M1 contract.
@@ -41,6 +42,32 @@ MASK128 = (1 << 128) - 1
 
 RESET_PC = 0x8000_0000
 TOHOST_ADDR = 0x8000_1000
+
+
+class IllegalInstruction(ValueError):
+    """An encoding the hart does not implement. With traps=True it traps (mcause 2)."""
+
+
+# Machine-mode CSRs (ADR 0014). Addresses with bits 11:10 == 3 are read-only.
+CSR_MSTATUS, CSR_MISA, CSR_MIE, CSR_MTVEC = 0x300, 0x301, 0x304, 0x305
+CSR_MSCRATCH, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MIP = 0x340, 0x341, 0x342, 0x343, 0x344
+CSR_MCYCLE, CSR_MINSTRET, CSR_CYCLE, CSR_INSTRET = 0xB00, 0xB02, 0xC00, 0xC02
+CSR_MVENDORID, CSR_MARCHID, CSR_MIMPID, CSR_MHARTID = 0xF11, 0xF12, 0xF13, 0xF14
+CSR_MLCFG, CSR_MLSTAT = 0x800, 0x801
+CSRS = frozenset({CSR_MSTATUS, CSR_MISA, CSR_MIE, CSR_MTVEC, CSR_MSCRATCH, CSR_MEPC,
+                  CSR_MCAUSE, CSR_MTVAL, CSR_MIP, CSR_MCYCLE, CSR_MINSTRET, CSR_CYCLE,
+                  CSR_INSTRET, CSR_MVENDORID, CSR_MARCHID, CSR_MIMPID, CSR_MHARTID,
+                  CSR_MLCFG, CSR_MLSTAT})
+MISA_VALUE = (2 << 62) | (1 << 8) | (1 << 12) | (1 << 23)   # RV64, I, M, X
+MSTATUS_MIE, MSTATUS_MPIE = 1 << 3, 1 << 7
+MSTATUS_MPP_M = 3 << 11
+CAUSE_ILLEGAL, CAUSE_BREAKPOINT, CAUSE_ECALL_M = 2, 3, 11
+INST_ECALL, INST_EBREAK, INST_MRET, INST_WFI = 0x00000073, 0x00100073, 0x30200073, 0x10500073
+
+
+def csr_legal(csr: int, writes: bool) -> bool:
+    """Does this CSR exist, and if the access writes it, is it writable? (ADR 0014)"""
+    return csr in CSRS and not (writes and (csr >> 10) == 3)
 
 
 def u64(x: int) -> int:
@@ -182,11 +209,15 @@ class Hart:
     """A single RV64I hart (machine mode)."""
 
     def __init__(self, mem: Memory | None = None, reset_pc: int = RESET_PC,
-                 tohost_addr: int = TOHOST_ADDR, ecall_halts: bool = True):
+                 tohost_addr: int = TOHOST_ADDR, ecall_halts: bool = True,
+                 traps: bool = False):
         self.mem = mem if mem is not None else Memory(base=reset_pc)
         self.reset_pc = reset_pc
         self.tohost_addr = tohost_addr
         self.ecall_halts = ecall_halts
+        self.traps = traps
+        # Co-sim hook: the RTL's mcycle value for this step (the ISS cannot know it).
+        self.cycle_override: int | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -198,6 +229,11 @@ class Hart:
         # Xmlacc custom CSRs: mlcfg (0x800, RAZ/WI) and mlstat (0x801).
         # mlstat bit0 = SAT sticky, set by mlacc.rqs clamp, write-1-to-clear.
         self.mlstat = 0
+        # Machine-mode CSRs (ADR 0014)
+        self.mstatus = MSTATUS_MPP_M
+        self.mtvec = self.mscratch = self.mepc = self.mcause = self.mtval = 0
+        self.mcycle = 0
+        self.minstret = 0
 
     @property
     def mlstat_sat(self) -> bool:
@@ -303,7 +339,7 @@ class Hart:
             elif funct3 == 0b111:  # REMUW
                 res = self._urem(ua, ub)
             else:
-                raise ValueError(f"illegal OP-32 M funct3: {funct3:#05b}")
+                raise IllegalInstruction(f"illegal OP-32 M funct3: {funct3:#05b}")
             return sext(res & MASK32, 32)
 
         # 64-bit variants
@@ -332,7 +368,78 @@ class Hart:
 
         pc = self.pc & MASK64
         inst = self.mem.fetch(pc)
+        self.mcycle = u64(self.mcycle + 1)
+        try:
+            return self._exec(pc, inst)
+        except IllegalInstruction:
+            if not self.traps:
+                raise
+            return self._trap(pc, inst, CAUSE_ILLEGAL, inst)
 
+    def _trap(self, pc: int, inst: int, cause: int, tval: int) -> dict:
+        """Take a synchronous trap: no register write, not counted in minstret."""
+        self.mepc = pc & ~3 & MASK64
+        self.mcause = cause
+        self.mtval = u64(tval)
+        mie = self.mstatus & MSTATUS_MIE
+        self.mstatus = (self.mstatus & ~(MSTATUS_MIE | MSTATUS_MPIE)) \
+            | (MSTATUS_MPIE if mie else 0) | MSTATUS_MPP_M
+        self.pc = self.mtvec
+        self.inst_count += 1
+        return {"pc": pc, "inst": inst, "rd": None, "rd_val": 0,
+                "mem_write": None, "halted": False, "trap": cause}
+
+    def _csr_read(self, csr: int) -> int:
+        if csr == CSR_MSTATUS:
+            return self.mstatus
+        if csr == CSR_MISA:
+            return MISA_VALUE
+        if csr == CSR_MTVEC:
+            return self.mtvec
+        if csr == CSR_MSCRATCH:
+            return self.mscratch
+        if csr == CSR_MEPC:
+            return self.mepc
+        if csr == CSR_MCAUSE:
+            return self.mcause
+        if csr == CSR_MTVAL:
+            return self.mtval
+        if csr in (CSR_MCYCLE, CSR_CYCLE):
+            return self.mcycle if self.cycle_override is None else u64(self.cycle_override)
+        if csr in (CSR_MINSTRET, CSR_INSTRET):
+            return self.minstret
+        if csr == CSR_MLSTAT:
+            return self.mlstat
+        return 0   # mie, mip, mlcfg, the ID registers
+
+    def _csr_write(self, csr: int, op: int, src: int, old: int) -> bool:
+        """Apply a CSR write. Returns True if it wrote minstret (ADR 0014 item 3)."""
+        if csr == CSR_MLSTAT:              # W1C: CSRRW and CSRRS clear, CSRRC no-op
+            if op in (0b01, 0b10):
+                self.mlstat &= ~u64(src) & MASK64
+            return False
+        new = {0b01: src, 0b10: old | src, 0b11: old & ~src}[op] & MASK64
+        if csr == CSR_MSTATUS:
+            self.mstatus = (new & (MSTATUS_MIE | MSTATUS_MPIE)) | MSTATUS_MPP_M
+        elif csr == CSR_MTVEC:
+            self.mtvec = new & ~3 & MASK64
+        elif csr == CSR_MSCRATCH:
+            self.mscratch = new
+        elif csr == CSR_MEPC:
+            self.mepc = new & ~3 & MASK64
+        elif csr == CSR_MCAUSE:
+            self.mcause = new
+        elif csr == CSR_MTVAL:
+            self.mtval = new
+        elif csr == CSR_MCYCLE:
+            self.mcycle = new
+        elif csr == CSR_MINSTRET:
+            self.minstret = new
+            return True
+        return False                       # misa, mie, mip, mlcfg: writes ignored
+
+    def _exec(self, pc: int, inst: int) -> dict:
+        no_count = False                   # this instruction wrote minstret
         rec = {"pc": pc, "inst": inst, "rd": None, "rd_val": 0,
                "mem_write": None, "halted": False}
 
@@ -362,7 +469,7 @@ class Hart:
 
         elif opcode == 0b1100111:  # JALR
             if funct3 != 0:
-                raise ValueError(f"illegal JALR funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                raise IllegalInstruction(f"illegal JALR funct3 at 0x{pc:016x}: 0x{inst:08x}")
             target = u64(self.rd_reg(rs1) + self._imm_i(inst)) & ~1  # clear lsb
             rd_val = next_pc
             wrote_rd = True
@@ -385,13 +492,13 @@ class Hart:
             elif funct3 == 0b111:  # BGEU
                 taken = a >= b
             else:
-                raise ValueError(f"illegal branch funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                raise IllegalInstruction(f"illegal branch funct3 at 0x{pc:016x}: 0x{inst:08x}")
             if taken:
                 next_pc = u64(pc + self._imm_b(inst))
 
         elif opcode == 0b0000011:  # loads
             if funct3 not in _LOADS:
-                raise ValueError(f"illegal load funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                raise IllegalInstruction(f"illegal load funct3 at 0x{pc:016x}: 0x{inst:08x}")
             size, signed = _LOADS[funct3]
             addr = u64(self.rd_reg(rs1) + self._imm_i(inst))
             raw = self.mem.load(addr, size)
@@ -400,7 +507,7 @@ class Hart:
 
         elif opcode == 0b0100011:  # stores
             if funct3 not in _STORES:
-                raise ValueError(f"illegal store funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                raise IllegalInstruction(f"illegal store funct3 at 0x{pc:016x}: 0x{inst:08x}")
             size = _STORES[funct3]
             addr = u64(self.rd_reg(rs1) + self._imm_s(inst))
             data = self.rd_reg(rs2) & ((1 << (8 * size)) - 1)
@@ -431,7 +538,7 @@ class Hart:
             elif funct3 == 0b001:  # SLLI (RV64: 6-bit shamt)
                 shamt = (inst >> 20) & 0x3F
                 if (inst >> 26) != 0b000000:
-                    raise ValueError(f"illegal SLLI at 0x{pc:016x}: 0x{inst:08x}")
+                    raise IllegalInstruction(f"illegal SLLI at 0x{pc:016x}: 0x{inst:08x}")
                 rd_val = u64(a << shamt)
             elif funct3 == 0b101:  # SRLI / SRAI (RV64: 6-bit shamt)
                 shamt = (inst >> 20) & 0x3F
@@ -441,12 +548,15 @@ class Hart:
                 elif top == 0b010000:  # SRAI
                     rd_val = u64(to_signed(a) >> shamt)
                 else:
-                    raise ValueError(f"illegal SRLI/SRAI at 0x{pc:016x}: 0x{inst:08x}")
+                    raise IllegalInstruction(f"illegal SRLI/SRAI at 0x{pc:016x}: 0x{inst:08x}")
             wrote_rd = True
 
         elif opcode == 0b0110011:  # OP (64-bit register-register)
             a = self.rd_reg(rs1)
             b = self.rd_reg(rs2)
+            if funct7 not in (0b0000000, 0b0000001, 0b0100000) or \
+                    (funct7 == 0b0100000 and funct3 not in (0b000, 0b101)):
+                raise IllegalInstruction(f"illegal OP funct7 at 0x{pc:016x}: 0x{inst:08x}")
             if funct7 == 0b0000001:  # RV64M mul/div
                 rd_val = self._muldiv(funct3, a, b, word=False)
             elif funct3 == 0b000:
@@ -478,7 +588,7 @@ class Hart:
             elif funct3 == 0b001:  # SLLIW
                 shamt = (inst >> 20) & 0x1F
                 if (inst >> 25) != 0b0000000:
-                    raise ValueError(f"illegal SLLIW at 0x{pc:016x}: 0x{inst:08x}")
+                    raise IllegalInstruction(f"illegal SLLIW at 0x{pc:016x}: 0x{inst:08x}")
                 rd_val = sext((a << shamt) & MASK32, 32)
             elif funct3 == 0b101:  # SRLIW / SRAIW (5-bit shamt, op on 32 bits)
                 shamt = (inst >> 20) & 0x1F
@@ -489,9 +599,9 @@ class Hart:
                 elif top == 0b0100000:  # SRAIW
                     rd_val = sext(u64(to_signed(a32, 32) >> shamt) & MASK32, 32)
                 else:
-                    raise ValueError(f"illegal SRLIW/SRAIW at 0x{pc:016x}: 0x{inst:08x}")
+                    raise IllegalInstruction(f"illegal SRLIW/SRAIW at 0x{pc:016x}: 0x{inst:08x}")
             else:
-                raise ValueError(f"illegal OP-IMM-32 funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                raise IllegalInstruction(f"illegal OP-IMM-32 funct3 at 0x{pc:016x}: 0x{inst:08x}")
             wrote_rd = True
 
         elif opcode == 0b0111011:  # OP-32 (W ops, register-register)
@@ -499,9 +609,12 @@ class Hart:
             b = self.rd_reg(rs2)
             a32 = a & MASK32
             b32 = b & MASK32
+            if funct7 not in (0b0000000, 0b0000001, 0b0100000) or \
+                    (funct7 == 0b0100000 and funct3 not in (0b000, 0b101)):
+                raise IllegalInstruction(f"illegal OP-32 funct7 at 0x{pc:016x}: 0x{inst:08x}")
             if funct7 == 0b0000001:  # RV64M *W mul/div
                 if funct3 not in (0b000, 0b100, 0b101, 0b110, 0b111):
-                    raise ValueError(f"illegal OP-32 M funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                    raise IllegalInstruction(f"illegal OP-32 M funct3 at 0x{pc:016x}: 0x{inst:08x}")
                 rd_val = self._muldiv(funct3, a, b, word=True)
             elif funct3 == 0b000:    # ADDW / SUBW
                 res = (a32 - b32) if funct7 == 0b0100000 else (a32 + b32)
@@ -514,7 +627,7 @@ class Hart:
                 else:                     # SRLW
                     rd_val = sext(a32 >> (b & 0x1F), 32)
             else:
-                raise ValueError(f"illegal OP-32 funct3 at 0x{pc:016x}: 0x{inst:08x}")
+                raise IllegalInstruction(f"illegal OP-32 funct3 at 0x{pc:016x}: 0x{inst:08x}")
             wrote_rd = True
 
         elif opcode == 0b0001011:  # CUSTOM0 — Xmlacc Tier-1 ML ops
@@ -550,59 +663,54 @@ class Hart:
                     self.mlstat |= 1  # SAT sticky
                 rd_val = u64(clamped)
             else:
-                raise ValueError(
+                raise IllegalInstruction(
                     f"illegal CUSTOM0/Xmlacc inst at 0x{pc:016x}: 0x{inst:08x}")
             wrote_rd = True
 
         elif opcode == 0b0001111:  # FENCE / FENCE.I -> no-op
-            pass
+            if funct3 not in (0b000, 0b001):
+                raise IllegalInstruction(f"illegal MISC-MEM funct3 at 0x{pc:016x}: 0x{inst:08x}")
 
-        elif opcode == 0b1110011:  # SYSTEM (ECALL only, in M1)
-            imm12 = inst >> 20
-            if imm12 == 0 and funct3 == 0:  # ECALL
-                if self.ecall_halts:
-                    self.halted = True
-                    self.halt_code = (True, 0)
-                    rec["halted"] = True
-            elif imm12 == 1 and funct3 == 0:  # EBREAK -> halt too
-                if self.ecall_halts:
-                    self.halted = True
-                    self.halt_code = (True, 0)
-                    rec["halted"] = True
-            elif funct3 in (0b001, 0b010, 0b011, 0b101, 0b110, 0b111):
-                # Zicsr — minimal support for the Xmlacc custom CSRs only:
-                #   0x800 mlcfg  : RAZ/WI (reads 0, writes ignored)
-                #   0x801 mlstat : bit0 = SAT sticky, write-1-to-clear (W1C)
-                csr = imm12 & 0xFFF
-                if csr not in (0x800, 0x801):
-                    raise ValueError(
-                        f"unsupported CSR 0x{csr:03x} at 0x{pc:016x}: 0x{inst:08x}")
-                # Source operand: register (funct3 0b0xx) or 5-bit zimm (0b1xx).
-                if funct3 & 0b100:
-                    src = rs1  # zimm = inst[19:15]
+        elif opcode == 0b1110011:  # SYSTEM
+            if funct3 == 0b000:
+                if inst in (INST_ECALL, INST_EBREAK):
+                    if self.traps:
+                        cause = CAUSE_ECALL_M if inst == INST_ECALL else CAUSE_BREAKPOINT
+                        return self._trap(pc, inst, cause, 0)
+                    if self.ecall_halts:
+                        self.halted = True
+                        self.halt_code = (True, 0)
+                        rec["halted"] = True
+                elif self.traps and inst == INST_MRET:
+                    mpie = self.mstatus & MSTATUS_MPIE
+                    self.mstatus = (self.mstatus & ~MSTATUS_MIE) | (MSTATUS_MIE if mpie else 0) \
+                        | MSTATUS_MPIE | MSTATUS_MPP_M
+                    next_pc = self.mepc
+                elif self.traps and inst == INST_WFI:
+                    pass                   # no interrupts: wfi is a no-op
                 else:
-                    src = self.rd_reg(rs1)
-                # Read old value.
-                old = self.mlstat if csr == 0x801 else 0
-                # A write happens for CSRRW always; for CSRRS/CSRRC only when the
-                # source operand register/zimm is non-zero.
+                    raise IllegalInstruction(
+                        f"unsupported SYSTEM inst at 0x{pc:016x}: 0x{inst:08x}")
+            elif funct3 == 0b100:
+                raise IllegalInstruction(f"illegal SYSTEM funct3 at 0x{pc:016x}: 0x{inst:08x}")
+            else:
+                # Zicsr (ADR 0014). Source: register (funct3 0b0xx) or 5-bit zimm (0b1xx).
+                csr = (inst >> 20) & 0xFFF
                 op = funct3 & 0b011
-                does_write = (op == 0b001) or (src != 0)
-                if does_write and csr == 0x801:
-                    if op == 0b001:    # CSRRW / CSRRWI : write-1-to-clear
-                        self.mlstat &= ~(u64(src)) & MASK64
-                    elif op == 0b010:  # CSRRS / CSRRSI : set-bits are W1C here
-                        self.mlstat &= ~(u64(src)) & MASK64
-                    elif op == 0b011:  # CSRRC / CSRRCI : clear-bits -> no-op on W1C
-                        pass
-                # mlcfg (0x800) ignores all writes (WI).
+                src = rs1 if funct3 & 0b100 else self.rd_reg(rs1)
+                # CSRRW always writes; CSRRS/CSRRC write only for a non-zero rs1/zimm field.
+                does_write = (op == 0b01) or (rs1 != 0)
+                if not csr_legal(csr, does_write):
+                    raise IllegalInstruction(
+                        f"illegal CSR access 0x{csr:03x} at 0x{pc:016x}: 0x{inst:08x}")
+                old = self._csr_read(csr)
+                if does_write:
+                    no_count = self._csr_write(csr, op, src, old)
                 rd_val = u64(old)
                 wrote_rd = True
-            else:
-                raise ValueError(f"unsupported SYSTEM inst at 0x{pc:016x}: 0x{inst:08x}")
 
         else:
-            raise ValueError(f"illegal opcode at 0x{pc:016x}: 0x{inst:08x}")
+            raise IllegalInstruction(f"illegal opcode at 0x{pc:016x}: 0x{inst:08x}")
 
         if wrote_rd:
             rec["rd"] = rd
@@ -614,6 +722,8 @@ class Hart:
 
         self.pc = next_pc & MASK64
         self.inst_count += 1
+        if not no_count:
+            self.minstret = u64(self.minstret + 1)
         return rec
 
     # -- run helper --------------------------------------------------------
