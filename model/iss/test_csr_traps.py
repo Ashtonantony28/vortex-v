@@ -1,7 +1,7 @@
 """ISS Zicsr and machine-mode traps (ADR 0014). Run: python3 -m pytest model/ -q"""
 import pytest
 
-from model.iss.rv64i import (CAUSE_BREAKPOINT, CAUSE_ECALL_M, CAUSE_ILLEGAL, MISA_VALUE,
+from rv64i import (CAUSE_BREAKPOINT, CAUSE_ECALL_M, CAUSE_ILLEGAL, MISA_VALUE,
                              MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_M, Hart,
                              IllegalInstruction, Memory, RESET_PC)
 
