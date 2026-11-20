@@ -21,6 +21,8 @@ package vortex_pkg;
   localparam logic [6:0] OPC_JALR     = 7'b1100111;
   localparam logic [6:0] OPC_JAL      = 7'b1101111;
   localparam logic [6:0] OPC_CUSTOM0  = 7'b0001011; // Xmlacc Tier-1 ML ops
+  localparam logic [6:0] OPC_MISC_MEM = 7'b0001111; // FENCE / FENCE.I
+  localparam logic [6:0] OPC_SYSTEM   = 7'b1110011; // Zicsr, ECALL/EBREAK/MRET/WFI
 
   // ---- funct3 selects within the Xmlacc (CUSTOM0) family ----
   localparam logic [2:0] F3_DOT8   = 3'b000;
@@ -122,8 +124,77 @@ package vortex_pkg;
     FU_MUL,  // RV64M multiplies
     FU_DIV,  // RV64M divides/remainders (iterative, one in flight)
     FU_XM,   // Xmlacc ops (1 cycle)
-    FU_AGU   // load/store address + store data into the memory queue
+    FU_AGU,  // load/store address + store data into the memory queue
+    FU_SYS   // SYSTEM / illegal / FENCE.I: runs alone at the ROB head (ADR 0014)
   } fu_e;
+
+  // ---------------------------------------------------------------------------
+  // Zicsr and machine-mode traps (ADR 0014)
+  // ---------------------------------------------------------------------------
+  typedef enum logic [2:0] {
+    SYS_CSR,     // CSRRW/CSRRS/CSRRC and the immediate forms
+    SYS_ECALL,
+    SYS_EBREAK,
+    SYS_MRET,
+    SYS_WFI,     // no interrupts yet: a no-op
+    SYS_FENCEI   // a no-op that serializes, so younger instructions are fetched after it
+  } sys_op_e;
+
+  localparam logic [31:0] INST_ECALL  = 32'h0000_0073;
+  localparam logic [31:0] INST_EBREAK = 32'h0010_0073;
+  localparam logic [31:0] INST_MRET   = 32'h3020_0073;
+  localparam logic [31:0] INST_WFI    = 32'h1050_0073;
+  localparam logic [2:0]  F3_FENCE    = 3'b000;
+  localparam logic [2:0]  F3_FENCEI   = 3'b001;
+  localparam logic [2:0]  F3_PRIV     = 3'b000;   // SYSTEM funct3 for ECALL..WFI
+  localparam logic [1:0]  CSR_OP_RW   = 2'b01;    // funct3[1:0]
+  localparam logic [1:0]  CSR_OP_RS   = 2'b10;
+  localparam logic [1:0]  CSR_OP_RC   = 2'b11;
+
+  localparam logic [11:0] CSR_MSTATUS   = 12'h300;
+  localparam logic [11:0] CSR_MISA      = 12'h301;
+  localparam logic [11:0] CSR_MIE       = 12'h304;
+  localparam logic [11:0] CSR_MTVEC     = 12'h305;
+  localparam logic [11:0] CSR_MSCRATCH  = 12'h340;
+  localparam logic [11:0] CSR_MEPC      = 12'h341;
+  localparam logic [11:0] CSR_MCAUSE    = 12'h342;
+  localparam logic [11:0] CSR_MTVAL     = 12'h343;
+  localparam logic [11:0] CSR_MIP       = 12'h344;
+  localparam logic [11:0] CSR_MLCFG     = 12'h800;
+  localparam logic [11:0] CSR_MLSTAT    = 12'h801;
+  localparam logic [11:0] CSR_MCYCLE    = 12'hB00;
+  localparam logic [11:0] CSR_MINSTRET  = 12'hB02;
+  localparam logic [11:0] CSR_CYCLE     = 12'hC00;
+  localparam logic [11:0] CSR_INSTRET   = 12'hC02;
+  localparam logic [11:0] CSR_MVENDORID = 12'hF11;
+  localparam logic [11:0] CSR_MARCHID   = 12'hF12;
+  localparam logic [11:0] CSR_MIMPID    = 12'hF13;
+  localparam logic [11:0] CSR_MHARTID   = 12'hF14;
+
+  localparam logic [63:0] CAUSE_ILLEGAL    = 64'd2;
+  localparam logic [63:0] CAUSE_BREAKPOINT = 64'd3;
+  localparam logic [63:0] CAUSE_ECALL_M    = 64'd11;
+
+  // mstatus fields: MIE, MPIE writable; MPP reads M (no other privilege modes).
+  localparam int unsigned MSTATUS_MIE_BIT  = 3;
+  localparam int unsigned MSTATUS_MPIE_BIT = 7;
+  localparam logic [63:0] MSTATUS_MPP_M    = 64'h1800;
+  // misa: MXL=2 (RV64), extensions I, M and X (non-standard: Xmlacc).
+  localparam logic [63:0] MISA_VALUE       = (64'd2 << 62) | (64'd1 << 8) | (64'd1 << 12)
+                                           | (64'd1 << 23);
+
+  // Does `csr` exist, and if the access writes it, is it writable? Addresses with
+  // bits 11:10 == 3 are read-only (privileged spec).
+  function automatic logic csr_legal(input logic [11:0] csr, input logic writes);
+    return ((csr == CSR_MSTATUS)  || (csr == CSR_MISA)      || (csr == CSR_MIE)
+         || (csr == CSR_MTVEC)    || (csr == CSR_MSCRATCH)  || (csr == CSR_MEPC)
+         || (csr == CSR_MCAUSE)   || (csr == CSR_MTVAL)     || (csr == CSR_MIP)
+         || (csr == CSR_MLCFG)    || (csr == CSR_MLSTAT)    || (csr == CSR_MCYCLE)
+         || (csr == CSR_MINSTRET) || (csr == CSR_CYCLE)     || (csr == CSR_INSTRET)
+         || (csr == CSR_MVENDORID) || (csr == CSR_MARCHID)  || (csr == CSR_MIMPID)
+         || (csr == CSR_MHARTID))
+        && !(writes && (csr[11:10] == 2'b11));
+  endfunction
 
 endpackage : vortex_pkg
 `endif

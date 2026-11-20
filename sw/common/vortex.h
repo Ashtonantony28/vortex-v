@@ -29,9 +29,25 @@ static inline int64_t xm_dot8(uint64_t a, uint64_t b) {
     return r;
 }
 
+// mlacc.rqs: requantize int32 -> int8 with round/shift/clamp; sets mlstat.SAT on a clamp
+static inline int64_t xm_rqs(int64_t x, uint64_t shift) {
+    int64_t r;
+    __asm__ volatile (".insn r 0x0b, 5, 0, %0, %1, %2" : "=r"(r) : "r"(x), "r"(shift));
+    return r;
+}
+
 static inline int64_t xm_macc(uint64_t a, uint64_t b, int64_t acc) {
     int64_t r;
     __asm__ volatile (".insn r4 0x0b, 4, 0, %0, %1, %2, %3" : "=r"(r) : "r"(a), "r"(b), "r"(acc));
     return r;
 }
+
+// Zicsr (ADR 0014). CSR numbers are written as literals so any assembler accepts them.
+#define CSR_READ(csr) ({ uint64_t v_; __asm__ volatile ("csrr %0, " #csr : "=r"(v_)); v_; })
+#define CSR_WRITE(csr, v) __asm__ volatile ("csrw " #csr ", %0" :: "r"((uint64_t)(v)))
+
+static inline uint64_t rdcycle(void)   { return CSR_READ(0xc00); }
+static inline uint64_t rdinstret(void) { return CSR_READ(0xc02); }
+static inline uint64_t mlstat_read(void) { return CSR_READ(0x801); }
+static inline void mlstat_clear(void)  { CSR_WRITE(0x801, 1); }   // SAT is write-1-to-clear
 #endif

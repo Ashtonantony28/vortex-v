@@ -1,5 +1,6 @@
 // Vortex-V SoC smoke test (ADR 0011): UART output, an int8 dot product on the
-// Xmlacc unit checked against plain C, the LEDs, and the cycle counter.
+// Xmlacc unit checked against plain C, CSRs (mlstat, instret), the LEDs, and the
+// cycle counter.
 #include "vortex.h"
 
 #define N 32                              // int8 elements per vector
@@ -29,6 +30,19 @@ static int mmio_ordered(void) {
     return busy && q == 14285;
 }
 
+// Zicsr (ADR 0014): a clamping rqs sets mlstat.SAT, a CSR write clears it, and
+// instret counts up.
+static int csr_ok(void) {
+    mlstat_clear();
+    uint64_t i0 = rdinstret();
+    int64_t r = xm_rqs(100000, 0);            // clamps to +127
+    int sat = mlstat_read() & 1;
+    mlstat_clear();
+    int clear = (mlstat_read() & 1) == 0;
+    uint64_t i1 = rdinstret();
+    return r == 127 && sat && clear && i1 > i0;
+}
+
 int main(void) {
     uart_puts("Vortex-V SoC: hello\n");
     int order_ok = mmio_ordered();
@@ -47,6 +61,10 @@ int main(void) {
     uart_puts("dot32 = ");
     uart_puthex((uint64_t)acc);
     uart_puts(ok ? " xmlacc ok\n" : " xmlacc MISMATCH\n");
+
+    int csr = csr_ok();
+    uart_puts(csr ? " csr ok\n" : " csr BROKEN\n");
+    ok = ok && csr;
 
     LEDS = ok ? 0xA : 0x5;
     uart_puts("cycles = ");

@@ -93,7 +93,8 @@ if cocotb is not None:
         assert lines[0] == "Vortex-V SoC: hello", lines
         assert lines[1] == ". mmio order ok", lines
         assert lines[2] == f"dot32 = {EXPECTED_DOT:016x} xmlacc ok", lines
-        assert lines[3].startswith("cycles = ") and int(lines[3][9:], 16) > 0, lines
+        assert lines[3] == " csr ok", lines
+        assert lines[4].startswith("cycles = ") and int(lines[4][9:], 16) > 0, lines
         assert int(dut.leds.value) == 0xA
 
 

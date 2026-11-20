@@ -72,7 +72,8 @@ def test_generator_covers_every_instruction_class():
         _, _, stats = RandomProgram(seed, n_items=N_ITEMS).build()
         total.update(stats)
     for kind in ("alu_rr", "alu_ri", "shift", "upper", "muldiv", "xmlacc", "load", "store",
-                 "branch", "jal", "jalr", "loop",
+                 "branch", "jal", "jalr", "loop", "csr", "csr_read", "mlstat_clear",
+                 "csrrw", "csrrsi", "fence",
                  "div", "divu", "rem", "remu", "divw", "remuw", "mulh", "mulhsu",
                  "dot8", "dot8u", "dot8su", "macc", "rqs"):
         assert total[kind] > 0, f"{kind} never generated across seeds {DEFAULT_SEEDS}"
