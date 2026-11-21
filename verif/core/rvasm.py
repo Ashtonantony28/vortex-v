@@ -213,6 +213,10 @@ class Asm:
     def bgeu(self, rs1, rs2, tgt): return self._emit(lambda pc, L: _enc_b(L[tgt] - pc, rs2, rs1, 0x7, OPC_BRANCH))
     # Jumps
     def jal(self, rd, tgt):        return self._emit(lambda pc, L: _enc_j(L[tgt] - pc, rd, OPC_JAL))
+    # Raw byte offsets, for targets no label can name (misaligned-target tests, ADR 0016)
+    def jal_off(self, rd, off):    return self._emit(lambda pc, L: _enc_j(off, rd, OPC_JAL))
+    def beq_off(self, rs1, rs2, off): return self._emit(lambda pc, L: _enc_b(off, rs2, rs1, 0x0, OPC_BRANCH))
+    def bne_off(self, rs1, rs2, off): return self._emit(lambda pc, L: _enc_b(off, rs2, rs1, 0x1, OPC_BRANCH))
     def jalr(self, rd, rs1, imm):  return self._emit(lambda pc, L: _enc_i(imm, rs1, 0x0, rd, OPC_JALR))
     def nop(self):                 return self.addi(0, 0, 0)
     # Xmlacc Tier-1 (opcode CUSTOM0 = 0x0B)

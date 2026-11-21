@@ -14,8 +14,10 @@ x31 tohost pointer.
 With irq=True (ADR 0015) the program also takes timer interrupts: a prologue
 enables them and arms the core harness's MTIMECMP, and a handler after the
 tohost store re-arms it a pseudo-random number of cycles ahead (from mcycle)
-and counts interrupts. x27 is then the handler's own register, so random code
-never uses it; the handler saves and restores everything else it touches.
+and counts interrupts. With faults=True (ADR 0016) some loads and stores are
+misaligned; the same handler counts each fault and skips the instruction. In
+either mode x27 is the handler's own register, so random code never uses it;
+the handler saves and restores everything else it touches.
 
 The same seed always yields the same program, so a failing seed reproduces.
 """
@@ -51,8 +53,10 @@ MSTATUS_MIE, MIE_MTIE = 1 << 3, 1 << 7
 # Interrupt mode: the handler's register, its save area (outside the checked data
 # region) and how far ahead it re-arms the timer: IRQ_GAP_MIN + (mcycle & IRQ_GAP_MASK).
 R_IRQ = 27
-IRQ_SAVE = TOHOST_ADDR + 0x40          # +0 x28, +8 x26, +16 interrupt count
+IRQ_SAVE = TOHOST_ADDR + 0x40          # +0 x28, +8 x26, +16 interrupt count, +24 fault count
 IRQ_FIRST, IRQ_GAP_MIN, IRQ_GAP_MASK = 40, 48, 63   # the gap outlasts the handler
+CSR_MEPC, CSR_MCAUSE = 0x341, 0x342
+MIS_WEIGHT = 3                         # misaligned loads/stores, relative to the mix
 # CSRs the random programs read (ADR 0014): mscratch, minstret, instret, mlstat,
 # mcycle, cycle, misa, mhartid.
 CSR_READS = [0x340, 0xB02, 0xC02, 0x801, 0xB00, 0xC00, 0x301, 0xF14]
@@ -88,13 +92,14 @@ def _interesting64(rng):
 class RandomProgram:
     """One random program. build() returns (Asm, data, stats)."""
 
-    def __init__(self, seed, n_items=180, mix=None, irq=False):
+    def __init__(self, seed, n_items=180, mix=None, irq=False, faults=False):
         self.seed = seed
         self.rng = random.Random(seed)
         self.n_items = n_items
         self.mix = dict(mix or DEFAULT_MIX)
         self.irq = irq
-        self.pool = [r for r in POOL if not (irq and r == R_IRQ)]
+        self.faults = faults
+        self.pool = [r for r in POOL if not ((irq or faults) and r == R_IRQ)]
         self.stats = Counter()
         self._label_n = 0
         self._recent_st = []      # offsets of the last few stores, for aliasing
@@ -135,7 +140,9 @@ class RandomProgram:
         kinds = ["alu_rr", "alu_ri", "shift", "upper", "muldiv", "xmlacc", "csr"]
         if allow_mem:
             kinds += ["load", "store"]
-        weights = [self.mix[k] for k in kinds]
+            if self.faults:
+                kinds += ["mis"]
+        weights = [self.mix.get(k, MIS_WEIGHT) for k in kinds]
         kind = self.rng.choices(kinds, weights)[0]
         rng = self.rng
         self.stats[kind] += 1
@@ -189,6 +196,15 @@ class RandomProgram:
             op, size = rng.choice(list(LOADS.items()))
             off = self._mem_off(size, is_store=False)
             getattr(a, op)(self._dst(), R_BASE, off)
+        elif kind == "mis":                       # misaligned: traps (ADR 0016)
+            ops = [(o, n) for o, n in list(LOADS.items()) + list(STORES.items()) if n > 1]
+            op, size = rng.choice(ops)
+            off = rng.randrange(0, MEM_SPAN - 8 + 1, size) + rng.randrange(1, size)
+            self.stats["mis"] += 1
+            if op in LOADS:
+                getattr(a, op)(self._dst(), R_BASE, off)
+            else:
+                getattr(a, op)(self._src(), R_BASE, off)
         else:  # store
             op, size = rng.choice(list(STORES.items()))
             off = self._mem_off(size, is_store=True)
@@ -217,7 +233,11 @@ class RandomProgram:
             self.stats["jalr"] += 1
             lbl = self._label()
             a.la_label(R_SCRATCH, lbl)
-            a.jalr(self._dst(), R_SCRATCH, 0)
+            if self.faults and rng.random() < 0.25:   # target 2 mod 4: traps (ADR 0016)
+                self.stats["mis_jalr"] += 1
+                a.jalr(self._dst(), R_SCRATCH, rng.choice([2, 3]))
+            else:
+                a.jalr(self._dst(), R_SCRATCH, 0)
             for _ in range(rng.randint(1, 3)):
                 self._emit_simple(a)
             a.label(lbl)
@@ -235,9 +255,11 @@ class RandomProgram:
 
     # -- timer interrupts (ADR 0015) -----------------------------------------
     def _irq_prologue(self, a):
-        """mtvec = handler, mie.MTIE, first interrupt IRQ_FIRST cycles from now, MIE."""
+        """mtvec = handler; with irq: mie.MTIE, first interrupt IRQ_FIRST cycles out, MIE."""
         a.la_label(R_IRQ, "irq_handler")
         a.csrw(CSR_MTVEC, R_IRQ)
+        if not self.irq:
+            return
         a.addi(R_IRQ, 0, MIE_MTIE)
         a.csrw(CSR_MIE, R_IRQ)
         a.csrr(R_IRQ, CSR_MCYCLE)
@@ -247,11 +269,22 @@ class RandomProgram:
         a.csrrsi(0, CSR_MSTATUS, MSTATUS_MIE)
 
     def _irq_handler(self, a):
-        """Count the interrupt and re-arm the timer; every register but x27 survives."""
+        """Interrupt: count it and re-arm the timer. Fault: count it and skip the
+        instruction. Every register but x27 survives."""
         a.label("irq_handler")
         a.la(R_IRQ, IRQ_SAVE)
         a.sd(R_SCRATCH, R_IRQ, 0)
         a.sd(26, R_IRQ, 8)
+        a.csrr(26, CSR_MCAUSE)
+        a.blt(26, 0, "irq_timer")                  # bit 63: an interrupt
+        a.ld(26, R_IRQ, 24)
+        a.addi(26, 26, 1)
+        a.sd(26, R_IRQ, 24)
+        a.csrr(R_SCRATCH, CSR_MEPC)
+        a.addi(R_SCRATCH, R_SCRATCH, 4)
+        a.csrw(CSR_MEPC, R_SCRATCH)
+        a.jal(0, "irq_return")
+        a.label("irq_timer")
         a.ld(26, R_IRQ, 16)
         a.addi(26, 26, 1)
         a.sd(26, R_IRQ, 16)
@@ -261,6 +294,7 @@ class RandomProgram:
         a.addi(R_SCRATCH, R_SCRATCH, IRQ_GAP_MIN)
         a.la(26, MTIMECMP_ADDR)
         a.sd(R_SCRATCH, 26, 0)
+        a.label("irq_return")
         a.ld(R_SCRATCH, R_IRQ, 0)
         a.ld(26, R_IRQ, 8)
         a.mret()
@@ -273,14 +307,14 @@ class RandomProgram:
         a.la(R_BASE, DATA_BASE)
         for i, r in enumerate(self.pool):
             a.ld(r, R_BASE, 8 * i)
-        if self.irq:
+        if self.irq or self.faults:
             self._irq_prologue(a)
         for _ in range(self.n_items):
             self._emit_item(a)
         a.la(R_TOHOST, TOHOST_ADDR)
         a.addi(R_SCRATCH, 0, 1)
         a.sw(R_SCRATCH, R_TOHOST, 0)
-        if self.irq:
+        if self.irq or self.faults:
             self._irq_handler(a)
         words = a.assemble()
         assert len(words) <= MAX_WORDS, \

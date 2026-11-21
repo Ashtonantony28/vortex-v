@@ -48,6 +48,15 @@ class IllegalInstruction(ValueError):
     """An encoding the hart does not implement. With traps=True it traps (mcause 2)."""
 
 
+class Misaligned(Exception):
+    """A misaligned jump target or load/store address (ADR 0016). Raised only with
+    traps=True; the hart then traps with this cause and mtval."""
+
+    def __init__(self, cause: int, tval: int):
+        super().__init__(f"misaligned (cause {cause}) at 0x{tval:016x}")
+        self.cause, self.tval = cause, tval
+
+
 # Machine-mode CSRs (ADR 0014). Addresses with bits 11:10 == 3 are read-only.
 CSR_MSTATUS, CSR_MISA, CSR_MIE, CSR_MTVEC = 0x300, 0x301, 0x304, 0x305
 CSR_MSCRATCH, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MIP = 0x340, 0x341, 0x342, 0x343, 0x344
@@ -62,6 +71,8 @@ MISA_VALUE = (2 << 62) | (1 << 8) | (1 << 12) | (1 << 23)   # RV64, I, M, X
 MSTATUS_MIE, MSTATUS_MPIE = 1 << 3, 1 << 7
 MSTATUS_MPP_M = 3 << 11
 CAUSE_ILLEGAL, CAUSE_BREAKPOINT, CAUSE_ECALL_M = 2, 3, 11
+# Misaligned traps (ADR 0016): instruction address (a jump target), load, store.
+CAUSE_MISALIGNED_FETCH, CAUSE_MISALIGNED_LOAD, CAUSE_MISALIGNED_STORE = 0, 4, 6
 # Machine timer interrupt (ADR 0015): mie.MTIE / mip.MTIP are bit 7.
 IRQ_M_TIMER = 7
 CAUSE_INTERRUPT = 1 << 63
@@ -381,6 +392,18 @@ class Hart:
             if not self.traps:
                 raise
             return self._trap(pc, inst, CAUSE_ILLEGAL, inst)
+        except Misaligned as m:
+            return self._trap(pc, inst, m.cause, m.tval)
+
+    def _check_target(self, target: int) -> None:
+        """No C extension: a jump target must be 4-byte aligned (IALIGN = 32)."""
+        if self.traps and (target & 3):
+            raise Misaligned(CAUSE_MISALIGNED_FETCH, target)
+
+    def _check_addr(self, addr: int, size: int, cause: int) -> None:
+        """Loads and stores must be naturally aligned; they trap instead (ADR 0016)."""
+        if self.traps and (addr & (size - 1)):
+            raise Misaligned(cause, addr)
 
     def take_interrupt(self, code: int = IRQ_M_TIMER) -> dict:
         """Take an interrupt before the instruction at pc (ADR 0015). The co-sim calls
@@ -488,6 +511,7 @@ class Hart:
             rd_val = next_pc
             wrote_rd = True
             next_pc = u64(pc + self._imm_j(inst))
+            self._check_target(next_pc)
 
         elif opcode == 0b1100111:  # JALR
             if funct3 != 0:
@@ -496,6 +520,7 @@ class Hart:
             rd_val = next_pc
             wrote_rd = True
             next_pc = target
+            self._check_target(next_pc)
 
         elif opcode == 0b1100011:  # branches
             a = self.rd_reg(rs1)
@@ -517,12 +542,14 @@ class Hart:
                 raise IllegalInstruction(f"illegal branch funct3 at 0x{pc:016x}: 0x{inst:08x}")
             if taken:
                 next_pc = u64(pc + self._imm_b(inst))
+                self._check_target(next_pc)
 
         elif opcode == 0b0000011:  # loads
             if funct3 not in _LOADS:
                 raise IllegalInstruction(f"illegal load funct3 at 0x{pc:016x}: 0x{inst:08x}")
             size, signed = _LOADS[funct3]
             addr = u64(self.rd_reg(rs1) + self._imm_i(inst))
+            self._check_addr(addr, size, CAUSE_MISALIGNED_LOAD)
             raw = self.mem.load(addr, size)
             rd_val = sext(raw, size * 8) if signed else u64(raw)
             wrote_rd = True
@@ -532,6 +559,7 @@ class Hart:
                 raise IllegalInstruction(f"illegal store funct3 at 0x{pc:016x}: 0x{inst:08x}")
             size = _STORES[funct3]
             addr = u64(self.rd_reg(rs1) + self._imm_s(inst))
+            self._check_addr(addr, size, CAUSE_MISALIGNED_STORE)
             data = self.rd_reg(rs2) & ((1 << (8 * size)) - 1)
             self.mem.store(addr, size, data)
             rec["mem_write"] = (addr, size, data)

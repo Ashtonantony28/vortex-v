@@ -123,3 +123,79 @@ def test_mip_read_uses_the_cosim_override():
     h.read_override = 0xFFFF
     h.step()
     assert h.x[1] == 1 << 7
+
+
+def _jal(rd, off):
+    return (((off >> 20) & 1) << 31) | (((off >> 1) & 0x3FF) << 21) | (((off >> 11) & 1) << 20) \
+        | (((off >> 12) & 0xFF) << 12) | (rd << 7) | 0x6F
+
+
+@pytest.mark.parametrize("words,cause,tval_off", [
+    ([addi(1, 0, 0), 0x0010_9183], 4, 1),           # lh x3, 1(x1)      (x1 = data base)
+    ([addi(1, 0, 0), 0x0020_A183], 4, 2),           # lw x3, 2(x1)
+    ([addi(1, 0, 0), 0x0040_B183], 4, 4),           # ld x3, 4(x1)
+    ([addi(1, 0, 0), 0x0030_91A3], 6, 3),           # sh x3, 3(x1)
+    ([addi(1, 0, 0), 0x0020_B323], 6, 6),           # sd x2, 6(x1)
+])
+def test_misaligned_load_store_traps(words, cause, tval_off):
+    from rv64i import CAUSE_MISALIGNED_LOAD, CAUSE_MISALIGNED_STORE
+    assert (cause, cause) in ((CAUSE_MISALIGNED_LOAD, 4), (CAUSE_MISALIGNED_STORE, 6))
+    base = RESET_PC + 0x800
+    h = hart([0x0000_0097, addi(1, 1, 0x7FC), addi(1, 1, 4)] + words[1:])
+    h.mtvec = RESET_PC + 0x100
+    run(h, 3)
+    assert h.x[1] == base
+    h.x[3] = 0x77
+    h.mem.store(base, 8, 0x1122334455667788)
+    rec = h.step()
+    assert rec["trap"] == cause and rec["rd"] is None and rec["mem_write"] is None
+    assert h.mcause == cause and h.mtval == base + tval_off and h.mepc == RESET_PC + 12
+    assert h.pc == RESET_PC + 0x100 and h.x[3] == 0x77
+    assert h.mem.load(base, 8) == 0x1122334455667788
+
+
+def test_aligned_and_byte_accesses_do_not_trap():
+    h = hart([0x0000_0097, addi(1, 1, 0x101),       # x1 = RESET_PC + 0x101 (odd)
+              0x0000_8183,                          # lb x3, 0(x1)
+              0x0030_8023,                          # sb x3, 0(x1)
+              0xFFF0_C203])                         # lbu x4, -1(x1)
+    run(h, 5)
+    assert h.mcause == 0 and h.pc == RESET_PC + 20
+
+
+@pytest.mark.parametrize("taken", [True, False])
+def test_misaligned_branch_target_traps_only_if_taken(taken):
+    from rv64i import CAUSE_MISALIGNED_FETCH
+    beq_6 = (0 << 25) | (0 << 20) | (0 << 15) | (0 << 12) | (0b0011 << 8) | 0x63   # beq x0,x0,+6
+    bne_6 = beq_6 | (1 << 12)                                                     # bne x0,x0,+6
+    h = hart([beq_6 if taken else bne_6, addi(1, 0, 1)])
+    h.mtvec = RESET_PC + 0x100
+    rec = h.step()
+    if taken:
+        assert rec["trap"] == CAUSE_MISALIGNED_FETCH and h.mtval == RESET_PC + 6
+        assert h.mepc == RESET_PC and h.pc == RESET_PC + 0x100
+    else:
+        assert "trap" not in rec and h.pc == RESET_PC + 4
+
+
+def test_misaligned_jal_and_jalr_targets_trap_without_writing_rd():
+    from rv64i import CAUSE_MISALIGNED_FETCH
+    h = hart([_jal(5, 6)])
+    h.mtvec = RESET_PC + 0x100
+    rec = h.step()
+    assert rec["trap"] == CAUSE_MISALIGNED_FETCH and rec["rd"] is None and h.x[5] == 0
+    assert h.mtval == RESET_PC + 6 and h.mepc == RESET_PC
+    # jalr clears bit 0 first: target +3 -> +2 is still misaligned, +1 -> +0 is fine
+    h = hart([0x0000_0097, 0x0030_82E7])            # auipc x1,0; jalr x5, 3(x1)
+    h.mtvec = RESET_PC + 0x100
+    run(h, 2)
+    assert h.mcause == CAUSE_MISALIGNED_FETCH and h.mtval == RESET_PC + 2 and h.x[5] == 0
+    h = hart([0x0000_0097, 0x0090_82E7])            # jalr x5, 9(x1) -> RESET_PC + 8
+    run(h, 2)
+    assert h.pc == RESET_PC + 8 and h.x[5] == RESET_PC + 8
+
+
+def test_without_traps_misaligned_accesses_still_run():
+    h = hart([0x0000_0097, addi(1, 1, 0x102), 0x0000_A183], traps=False)   # lw x3, 0(x1)
+    run(h, 3)
+    assert h.pc == RESET_PC + 12

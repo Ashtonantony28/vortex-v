@@ -22,6 +22,10 @@
 // instruction executing) and gives the pc of the next instruction (`irq_pc`);
 // it then fetches from `trap_vector`.
 //
+// Faults (ADR 0016): a misaligned jump target, load or store is found by the
+// core, not decoded here. The core asserts `fault` for one cycle with the cause,
+// mtval and the faulting pc, and fetches from `trap_vector` next.
+//
 // Reset is asynchronous, like the cores that instantiate it.
 `ifndef VORTEX_CSR_SV
 `define VORTEX_CSR_SV
@@ -53,7 +57,12 @@ module vortex_csr
   output logic            irq_pending,
   input  logic            irq_take,
   input  logic [XLEN-1:0] irq_pc,
-  output logic [XLEN-1:0] trap_vector
+  output logic [XLEN-1:0] trap_vector,
+  // Synchronous fault found by the core (ADR 0016)
+  input  logic            fault,
+  input  logic [XLEN-1:0] fault_cause,
+  input  logic [XLEN-1:0] fault_tval,
+  input  logic [XLEN-1:0] fault_pc
 );
   localparam logic [XLEN-1:0] ALIGN_MASK = ~XLEN'(3);   // mtvec/mepc: IALIGN = 32
   localparam logic [XLEN-1:0] MSTATUS_WMASK = (XLEN'(1) << MSTATUS_MIE_BIT)
@@ -159,6 +168,14 @@ module vortex_csr
         mcause_r  <= illegal ? XLEN'(CAUSE_ILLEGAL)
                    : (op == SYS_EBREAK) ? XLEN'(CAUSE_BREAKPOINT) : XLEN'(CAUSE_ECALL_M);
         mtval_r   <= illegal ? XLEN'(inst) : '0;
+        mstatus_r <= XLEN'(MSTATUS_MPP_M)
+                   | (XLEN'(mstatus_r[MSTATUS_MIE_BIT]) << MSTATUS_MPIE_BIT);
+      end
+      // A fault replaces the faulting instruction; nothing else executes with it.
+      if (fault) begin
+        mepc_r    <= fault_pc & ALIGN_MASK;
+        mcause_r  <= fault_cause;
+        mtval_r   <= fault_tval;
         mstatus_r <= XLEN'(MSTATUS_MPP_M)
                    | (XLEN'(mstatus_r[MSTATUS_MIE_BIT]) << MSTATUS_MPIE_BIT);
       end

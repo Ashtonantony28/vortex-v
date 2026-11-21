@@ -174,6 +174,10 @@ package vortex_pkg;
   localparam logic [63:0] CAUSE_ILLEGAL    = 64'd2;
   localparam logic [63:0] CAUSE_BREAKPOINT = 64'd3;
   localparam logic [63:0] CAUSE_ECALL_M    = 64'd11;
+  // Misaligned traps (ADR 0016): a jump target, a load or a store address
+  localparam logic [63:0] CAUSE_MISALIGNED_FETCH = 64'd0;
+  localparam logic [63:0] CAUSE_MISALIGNED_LOAD  = 64'd4;
+  localparam logic [63:0] CAUSE_MISALIGNED_STORE = 64'd6;
   // Machine timer interrupt (ADR 0015): mcause bit 63 set, code 7; mie.MTIE/mip.MTIP bit 7.
   localparam int unsigned IRQ_M_TIMER      = 7;
   localparam logic [63:0] CAUSE_M_TIMER_IRQ = (64'd1 << 63) | 64'd7;

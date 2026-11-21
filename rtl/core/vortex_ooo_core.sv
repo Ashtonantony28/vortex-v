@@ -24,6 +24,10 @@
 // restores a RAT/free-list checkpoint and squashes everything younger. JALR
 // always stops dispatch until it executes. JAL redirects at decode.
 //
+// Faults found at execute (misaligned load/store address or jump target,
+// ADR 0016) are marked in the ROB and taken when the op is the head, by
+// flushing everything back to the committed RAT and redirecting to mtvec.
+//
 // Wakeup is a global per-preg ready vector: a producer sets its bit as it writes
 // the PRF at the end of its execute cycle, and a consumer can issue the next
 // cycle reading the PRF directly, so 1-cycle ops issue back to back with no
@@ -168,6 +172,9 @@ module vortex_ooo_core
   logic            rob_complete [ROB_DEPTH];
   logic            rob_sat      [ROB_DEPTH];
   logic            rob_load     [ROB_DEPTH];   // LSQ: a load, popped from the memq at commit
+  logic            rob_exc      [ROB_DEPTH];   // faults when it reaches the head (ADR 0016)
+  logic            rob_exc_cf   [ROB_DEPTH];   // ... with a misaligned jump target (else memory)
+  logic [XLEN-1:0] cf_tval;                    // that target (one jump in flight at a time)
   logic [RW-1:0]   rob_head, rob_tail;
   logic [RW:0]     rob_count;
 
@@ -378,21 +385,30 @@ module vortex_ooo_core
   assign d_fu  = fu_class(d_sys, is_load || is_store, is_muldiv, md_op, is_xmlacc);
   assign d_fu1 = fu_class(d_sys1, is_load1 || is_store1, is_muldiv1, md_op1, is_xmlacc1);
 
+  // A JAL or branch whose offset has bit 1 set has a misaligned target (pc is
+  // 4-byte aligned). A JAL faults for sure; such a branch faults if taken, so it
+  // is not predicted and stops dispatch until it resolves (ADR 0016).
+  logic d_jal_mis, d_br_mis, d_br_mis1, d_jal_mis1;
+  assign d_jal_mis  = is_jal && imm[1];
+  assign d_br_mis   = is_branch && imm[1];
+  assign d_jal_mis1 = is_jal1 && imm1[1];
+  assign d_br_mis1  = is_branch1 && imm1[1];
+
+  // Branch prediction at decode: 2-bit counter, predict taken if bit 1 is set.
+  logic d_spec0, d_spec1, pred0, pred1;
+  assign d_spec0 = SPEC && is_branch && !d_br_mis;
+  assign d_spec1 = SPEC && is_branch1 && !d_br_mis1;
+
   logic d_has_rd, d_is_mem, d_ctrl_wait;
   assign d_has_rd    = reg_we && (rd_addr != '0);
   assign d_is_mem    = is_load || is_store;
-  assign d_ctrl_wait = is_jalr || (is_branch && !SPEC)    // stop dispatch until it resolves
-                    || d_sys;
+  assign d_ctrl_wait = is_jalr || (is_branch && !d_spec0)  // stop dispatch until it resolves
+                    || d_jal_mis || d_sys;
 
   logic d_has_rd1, d_is_mem1, d_ctrl_wait1;
   assign d_has_rd1    = reg_we1 && (rd_addr1 != '0);
   assign d_is_mem1    = is_load1 || is_store1;
   assign d_ctrl_wait1 = is_jalr1 || (is_branch1 && !SPEC);
-
-  // Branch prediction at decode: 2-bit counter, predict taken if bit 1 is set.
-  logic d_spec0, d_spec1, pred0, pred1;
-  assign d_spec0 = SPEC && is_branch;
-  assign d_spec1 = SPEC && is_branch1;
   assign pred0   = bht[pc[BW+1:2]][1];
   assign pred1   = bht[pc1[BW+1:2]][1];
 
@@ -442,6 +458,15 @@ module vortex_ooo_core
 
   logic squash;   // a predicted branch resolved the other way this cycle
 
+  // Misaligned faults (ADR 0016). A faulting op is marked in the ROB (rob_exc)
+  // and does nothing else: a load or store never reaches memory, a jump does not
+  // redirect (dispatch stays stopped behind it). When it reaches the head it
+  // traps: the pipeline is flushed back to the committed state and fetch goes
+  // to mtvec. The op itself does not commit and is not counted in minstret.
+  logic            fault_take;
+  logic [XLEN-1:0] fault_cause, fault_tval;
+  assign fault_take = !halted && (rob_count != '0) && rob_exc[rob_head];
+
   // Timer interrupt (ADR 0015): taken with nothing in flight, so no instruction
   // is half done and pc is the next instruction in program order.
   logic            irq_pending, take_irq;
@@ -450,7 +475,7 @@ module vortex_ooo_core
 
   logic dispatch;
   // A pending interrupt stops dispatch; it is taken once the ROB has drained.
-  assign dispatch = !halted && !fe_wait && !squash && !irq_pending
+  assign dispatch = !halted && !fe_wait && !squash && !irq_pending && !fault_take
                  && !(d_spec0 && spec_active)   // one predicted branch at a time
                  && (rob_count != (RW+1)'(ROB_DEPTH))
                  && iq_has_free
@@ -471,6 +496,7 @@ module vortex_ooo_core
 
   logic dispatch1;
   assign dispatch1 = DUAL && dispatch && !(is_jal || is_branch || is_jalr || d_sys) && !d_sys1
+                  && !d_jal_mis1 && !d_br_mis1     // a possible fault goes in slot 0
                   && !(d_spec1 && spec_active)
                   && (rob_count <= (RW+1)'(ROB_DEPTH - 2))
                   && iq_has_free2
@@ -606,11 +632,22 @@ module vortex_ooo_core
     .irq_pending(irq_pending),
     .irq_take   (take_irq),
     .irq_pc     (pc),
-    .trap_vector(trap_vector)
+    .trap_vector(trap_vector),
+    .fault      (fault_take),
+    .fault_cause(fault_cause),
+    .fault_tval (fault_tval),
+    .fault_pc   (rob_pc[rob_head])
   );
 
+  // A JALR or unpredicted branch that would jump to a misaligned target faults
+  // instead of redirecting (ADR 0016).
+  logic cf_fault0;
+  assign cf_fault0 = issue && (i_fu == FU_ALU)
+                  && ((iq_jalr[s_idx] && jalr_target[1])
+                      || (iq_branch[s_idx] && !iq_spec[s_idx] && br_taken && br_target[1]));
+
   logic redirect;
-  assign redirect = (issue && (i_fu == FU_ALU)
+  assign redirect = (issue && (i_fu == FU_ALU) && !cf_fault0
                      && (iq_jalr[s_idx] || (iq_branch[s_idx] && !iq_spec[s_idx])))
                  || sys_fire;
 
@@ -641,8 +678,18 @@ module vortex_ooo_core
     .taken (p1_taken)
   );
 
+  logic [XLEN-1:0] p1_jalr_target, p1_br_target;
+  assign p1_jalr_target = (p1_op1 + p1_imm) & ~XLEN'(1);
+  assign p1_br_target   = p1_pc + p1_imm;
+
+  logic cf_fault1;
+  assign cf_fault1 = issue1
+                  && ((iq_jalr[s1_idx] && p1_jalr_target[1])
+                      || (iq_branch[s1_idx] && !iq_spec[s1_idx] && p1_taken && p1_br_target[1]));
+
   logic redirect1;
-  assign redirect1 = issue1 && (iq_jalr[s1_idx] || (iq_branch[s1_idx] && !iq_spec[s1_idx]));
+  assign redirect1 = issue1 && !cf_fault1
+                  && (iq_jalr[s1_idx] || (iq_branch[s1_idx] && !iq_spec[s1_idx]));
 
   // ---------------------------------------------------------------------------
   // Predicted-branch resolution (ADR 0008). At most one is in flight, so only
@@ -813,11 +860,21 @@ module vortex_ooo_core
   logic [XLEN-1:0] agu_addr;
   assign agu_addr = op1 + i_imm;
 
+  // A memory op whose address is not naturally aligned never executes; it
+  // faults at the ROB head (ADR 0016). mq_mis is meaningful once mq_ready.
+  logic [MEMQ_DEPTH-1:0] mq_mis;
+  logic                  agu_mis;
+  for (genvar gm = 0; gm < MEMQ_DEPTH; gm++) begin : g_mis
+    assign mq_mis[gm] = (mq_addr[gm][2:0] & ((3'd1 << mq_size[gm]) - 3'd1)) != 3'd0;
+  end
+  assign agu_mis = (agu_addr[2:0] & ((3'd1 << mq_size[iq_memq[s_idx]]) - 3'd1)) != 3'd0;
+
   logic mq_nonempty, ld_fire, st_fire;
   assign mq_nonempty = (mq_count != '0);
-  assign ld_fire = !halted && mq_nonempty && !mq_store[mq_head] && mq_ready[mq_head];
+  assign ld_fire = !halted && mq_nonempty && !mq_store[mq_head] && mq_ready[mq_head]
+                && !mq_mis[mq_head];
   assign st_fire = !halted && mq_nonempty &&  mq_store[mq_head] && mq_ready[mq_head]
-                && (rob_count != '0) && (mq_rob[mq_head] == rob_head);
+                && !mq_mis[mq_head] && (rob_count != '0) && (mq_rob[mq_head] == rob_head);
 
   // ---------------------------------------------------------------------------
   // LSQ (ADR 0009): any load in the queue may execute once every older store in
@@ -873,6 +930,7 @@ module vortex_ooo_core
     for (int i = MEMQ_DEPTH - 1; i >= 0; i--) begin
       idx = mq_head + MW'(i);
       if (((MW+1)'(i) < mq_count) && !mq_store[idx] && mq_ready[idx] && !mq_done[idx]
+          && !mq_mis[idx]
           && !f_unknown[i] && !f_partial[i] && (f_hit[i] || !st_fire)
           && ((i == 0) || (mq_addr[idx] >= IO_LIMIT))) begin
         lq_found = 1'b1;
@@ -930,7 +988,14 @@ module vortex_ooo_core
   // Commit
   // ---------------------------------------------------------------------------
   logic commit;
-  assign commit = !halted && (rob_count != '0) && (rob_complete[rob_head] || st_fire);
+  assign commit = !halted && (rob_count != '0) && !rob_exc[rob_head]
+               && (rob_complete[rob_head] || st_fire);
+
+  // The fault's cause and mtval: the jump target, or the memory op's address
+  // (a faulting memory op at the ROB head is also the memory-queue head).
+  assign fault_cause = rob_exc_cf[rob_head] ? CAUSE_MISALIGNED_FETCH
+                     : mq_store[mq_head]    ? CAUSE_MISALIGNED_STORE : CAUSE_MISALIGNED_LOAD;
+  assign fault_tval  = rob_exc_cf[rob_head] ? cf_tval : mq_addr[mq_head];
 
   logic [XLEN-1:0] commit_data;
   assign commit_data = prf[rob_newp[rob_head]];
@@ -943,7 +1008,7 @@ module vortex_ooo_core
   assign rob_head1     = rob_head + RW'(1);
   assign tohost_commit = st_fire && (mq_addr[mq_head] == TOHOST_ADDR);
   assign commit1       = DUAL && commit && !tohost_commit && (rob_count >= (RW+1)'(2))
-                      && rob_complete[rob_head1];
+                      && rob_complete[rob_head1] && !rob_exc[rob_head1];
   assign commit_data1  = prf[rob_newp[rob_head1]];
 
   // LSQ: a load stays in the queue until it commits, and leaves then (it is the
@@ -983,7 +1048,7 @@ module vortex_ooo_core
   always_comb begin
     pc_n = pc;
     if (dispatch) begin
-      if (is_jal || (d_spec0 && pred0))      pc_n = pc + imm;
+      if ((is_jal && !d_jal_mis) || (d_spec0 && pred0)) pc_n = pc + imm;
       else if (!dispatch1)                   pc_n = pc1;
       else if (is_jal1 || (d_spec1 && pred1)) pc_n = pc1 + imm1;
       else                                   pc_n = pc1 + INST_BYTES;
@@ -997,11 +1062,12 @@ module vortex_ooo_core
     // At most one branch/JALR is ever in flight, so redirect and redirect1
     // never fire together.
     if (redirect1) begin
-      if (iq_jalr[s1_idx]) pc_n = (p1_op1 + p1_imm) & ~XLEN'(1);
-      else if (p1_taken)   pc_n = p1_pc + p1_imm;
+      if (iq_jalr[s1_idx]) pc_n = p1_jalr_target;
+      else if (p1_taken)   pc_n = p1_br_target;
     end
     if (squash) pc_n = squash_pc;
     if (take_irq) pc_n = trap_vector;   // nothing in flight: no other source this cycle
+    if (fault_take) pc_n = trap_vector; // the flush overrides every younger redirect
   end
 
   // ---------------------------------------------------------------------------
@@ -1145,6 +1211,9 @@ module vortex_ooo_core
         rob_complete[rob_tail] <= 1'b0;
         rob_sat[rob_tail]      <= 1'b0;
         rob_load[rob_tail]     <= is_load;
+        rob_exc[rob_tail]      <= d_jal_mis;
+        rob_exc_cf[rob_tail]   <= d_jal_mis;
+        if (d_jal_mis) cf_tval <= pc + imm;
         rob_tail               <= rob_tail + RW'(1) + RW'(dispatch1);
 
         iq_valid[iq_free_idx]   <= 1'b1;
@@ -1199,6 +1268,8 @@ module vortex_ooo_core
         rob_complete[rob_tail1] <= 1'b0;
         rob_sat[rob_tail1]      <= 1'b0;
         rob_load[rob_tail1]     <= is_load1;
+        rob_exc[rob_tail1]      <= 1'b0;
+        rob_exc_cf[rob_tail1]   <= 1'b0;
 
         iq_valid[iq_free_idx2]   <= 1'b1;
         iq_fu[iq_free_idx2]      <= d_fu1;
@@ -1277,16 +1348,28 @@ module vortex_ooo_core
         fe_wait <= 1'b0;
       end
       if (issue && (i_fu == FU_AGU)) begin
+        rob_exc[iq_rob[s_idx]]   <= agu_mis;
         mq_ready[iq_memq[s_idx]] <= 1'b1;
         mq_addr[iq_memq[s_idx]]  <= agu_addr;
         mq_data[iq_memq[s_idx]]  <= op2;
       end
       dbg_xm_macs <= dbg_xm_macs + DBG_CNT_W'(xm_macs_now) * DBG_CNT_W'(XM_LANES);
+      if (cf_fault0) begin
+        rob_exc[iq_rob[s_idx]]    <= 1'b1;
+        rob_exc_cf[iq_rob[s_idx]] <= 1'b1;
+        cf_tval                   <= iq_jalr[s_idx] ? jalr_target : br_target;
+      end
+      if (cf_fault1) begin
+        rob_exc[iq_rob[s1_idx]]    <= 1'b1;
+        rob_exc_cf[iq_rob[s1_idx]] <= 1'b1;
+        cf_tval                    <= iq_jalr[s1_idx] ? p1_jalr_target : p1_br_target;
+      end
 
       // ---- Pipelined Xmlacc: advance, drop squashed ops, write back ----
       if (XMP) begin
         for (int u = 0; u < XNP; u++) begin
-          xp_valid[u][0]  <= xi_valid[u] && !(squash && ((xi_rob[u] - rob_head) > br_age));
+          xp_valid[u][0]  <= xi_valid[u] && !fault_take
+                             && !(squash && ((xi_rob[u] - rob_head) > br_age));
           xp_has_rd[u][0] <= xi_has_rd[u];
           xp_mac[u][0]    <= xi_mac[u];
           xp_sat[u][0]    <= xi_sat[u];
@@ -1294,7 +1377,7 @@ module vortex_ooo_core
           xp_rob[u][0]    <= xi_rob[u];
           xp_data[u][0]   <= xi_data[u];
           for (int k = 1; k < XS; k++) begin
-            xp_valid[u][k]  <= xp_valid[u][k-1]
+            xp_valid[u][k]  <= xp_valid[u][k-1] && !fault_take
                                && !(squash && ((xp_rob[u][k-1] - rob_head) > br_age));
             xp_has_rd[u][k] <= xp_has_rd[u][k-1];
             xp_mac[u][k]    <= xp_mac[u][k-1];
@@ -1352,7 +1435,8 @@ module vortex_ooo_core
       // SYNC_MEM: hold the load's tags for next cycle's writeback. A load that a
       // squash this cycle makes dead is dropped: its ROB entry and destination
       // may be handed out again next cycle.
-      lw_valid  <= SYNC && lx_fire && !(squash && ((mq_rob[lx_idx] - rob_head) > br_age));
+      lw_valid  <= SYNC && lx_fire && !fault_take
+                   && !(squash && ((mq_rob[lx_idx] - rob_head) > br_age));
       lw_has_rd <= mq_has_rd[lx_idx];
       lw_uns    <= mq_uns[lx_idx];
       lw_hit    <= lx_hit;
@@ -1478,6 +1562,31 @@ module vortex_ooo_core
           mq_tail  <= mq_head + MW'(mq_keep);
           mq_count <= mq_keep - (MW+1)'(mq_pop);
         end
+      end
+
+      // ---- Fault at the head: flush everything back to the committed state ----
+      // Nothing commits or dispatches this cycle, and this block wins over a
+      // squash or redirect from a younger op. The pregs of every in-flight op
+      // go back to the free list (they were taken from its head in order).
+      if (fault_take) begin
+        pc          <= pc_n;
+        fe_wait     <= 1'b0;
+        spec_active <= 1'b0;
+        for (int r = 0; r < NARCH; r++) spec_rat[r] <= arch_rat[r];
+        fl_head     <= fl_head - PW'((PW+1)'(NFREE0) - fl_count);
+        fl_count    <= (PW+1)'(NFREE0);
+        rob_tail    <= rob_head;
+        rob_count   <= '0;
+        for (int q = 0; q < IQ_DEPTH; q++) iq_valid[q] <= 1'b0;
+        mq_tail     <= mq_head + MW'(mq_pop);
+        mq_count    <= '0;
+        if (mul_start || mul_busy) mul_kill <= 1'b1;
+        if (div_start || div_busy) div_kill <= 1'b1;
+        // Report the faulting instruction to the co-sim, with no register write.
+        dbg_retire_valid <= 1'b1;
+        dbg_retire_pc    <= rob_pc[rob_head];
+        dbg_wb_valid     <= 1'b0;
+        dbg_wb_data      <= '0;
       end
     end
   end

@@ -235,6 +235,23 @@ module vortex_core
   logic            retiring, csr_exec, csr_redirect, csr_no_count, sat_set;
   logic [XLEN-1:0] csr_rdata, csr_target, trap_vector;
   assign retiring = running && !md_stall && !take_irq;
+
+  // Misaligned faults (ADR 0016): a load/store address that is not naturally
+  // aligned, or a taken jump/branch target that is not 4-byte aligned. The
+  // instruction does nothing (no memory access, no register write, not counted)
+  // and traps with mtval = the address or target.
+  logic [XLEN-1:0] br_target, jalr_target, fault_cause, fault_tval;
+  logic            mem_mis, jmp_mis, fault;
+  assign br_target   = pc + imm;                  // JAL and taken branches
+  assign jalr_target = (rs1_data + imm) & ~XLEN'(1);   // LSB cleared per spec
+  assign mem_mis     = (is_load || is_store)
+                    && ((alu_y[2:0] & ((3'd1 << mem_size) - 3'd1)) != 3'd0);
+  assign jmp_mis     = ((is_jal || (is_branch && branch_taken)) && br_target[1])
+                    || (is_jalr && jalr_target[1]);
+  assign fault       = retiring && (mem_mis || jmp_mis);
+  assign fault_cause = jmp_mis ? CAUSE_MISALIGNED_FETCH
+                     : is_load ? CAUSE_MISALIGNED_LOAD : CAUSE_MISALIGNED_STORE;
+  assign fault_tval  = jmp_mis ? (is_jalr ? jalr_target : br_target) : alu_y;
   assign csr_exec = retiring && (is_sys || dec_illegal);
   assign sat_set  = retiring && is_xmlacc && (xm_op == XM_RQS) && xm_sat;
 
@@ -251,34 +268,37 @@ module vortex_core
     .redirect   (csr_redirect),
     .target     (csr_target),
     .no_count   (csr_no_count),
-    .retire_cnt (2'(retiring && !csr_no_count)),
+    .retire_cnt (2'(retiring && !csr_no_count && !fault)),
     .sat_set    (sat_set),
     .mlstat_sat (dbg_mlstat_sat),
     .irq_timer  (irq_timer),
     .irq_pending(irq_pending),
     .irq_take   (take_irq),
     .irq_pc     (pc),
-    .trap_vector(trap_vector)
+    .trap_vector(trap_vector),
+    .fault      (fault),
+    .fault_cause(fault_cause),
+    .fault_tval (fault_tval),
+    .fault_pc   (pc)
   );
 
   // ---------------------------------------------------------------------------
   // Next-PC selection
   // ---------------------------------------------------------------------------
-  logic [XLEN-1:0] pc_plus4, jalr_target, next_pc;
+  logic [XLEN-1:0] pc_plus4, next_pc;
   assign pc_plus4    = pc + 64'd4;
-  assign jalr_target = (rs1_data + imm) & ~64'd1; // LSB cleared per spec
 
   always_comb begin
-    if (take_irq) begin
-      next_pc = trap_vector;                      // interrupt -> mtvec
+    if (take_irq || fault) begin
+      next_pc = trap_vector;                      // interrupt or fault -> mtvec
     end else if (csr_redirect) begin
       next_pc = csr_target;                       // trap -> mtvec, mret -> mepc
     end else if (is_jal) begin
-      next_pc = pc + imm;
+      next_pc = br_target;
     end else if (is_jalr) begin
       next_pc = jalr_target;
     end else if (is_branch && branch_taken) begin
-      next_pc = pc + imm;
+      next_pc = br_target;
     end else begin
       next_pc = pc_plus4;
     end
@@ -287,8 +307,8 @@ module vortex_core
   // ---------------------------------------------------------------------------
   // Data memory interface (combinational outputs for this cycle)
   // ---------------------------------------------------------------------------
-  assign dmem_req   = running && !take_irq && (is_load || is_store);
-  assign dmem_we    = running && !take_irq && is_store;
+  assign dmem_req   = running && !take_irq && !mem_mis && (is_load || is_store);
+  assign dmem_we    = running && !take_irq && !mem_mis && is_store;
   assign dmem_addr  = alu_y;             // rs1 + imm
   assign dmem_size  = mem_size;
   assign dmem_wdata = rs2_data;          // right-justified; TB writes mem_size bytes
@@ -320,7 +340,7 @@ module vortex_core
   // Actual architectural register write enable (x0 handled in regfile).
   // Suppressed while a muldiv op is stalling (it fires on the op's done cycle)
   // and when an interrupt is taken instead.
-  assign rf_we = retiring && reg_we;
+  assign rf_we = retiring && reg_we && !fault;
 
   // tohost halt detection: a committed store to TOHOST_ADDR
   logic tohost_store;
@@ -361,9 +381,9 @@ module vortex_core
       pc               <= next_pc;
       dbg_retire_valid <= 1'b1;
       dbg_retire_pc    <= pc;
-      dbg_wb_valid     <= reg_we && (rd_addr != 5'd0);
+      dbg_wb_valid     <= rf_we && (rd_addr != 5'd0);
       dbg_wb_rd        <= rd_addr;
-      dbg_wb_data      <= (reg_we && (rd_addr != 5'd0)) ? wb_data : '0;
+      dbg_wb_data      <= (rf_we && (rd_addr != 5'd0)) ? wb_data : '0;
       dbg_irq          <= 1'b0;
       if (tohost_store) begin
         halted <= 1'b1;

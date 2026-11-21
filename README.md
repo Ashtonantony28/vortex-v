@@ -16,7 +16,7 @@ A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML exten
 > and runs gcc-built C programs from `sw/` (ADR 0011); `SYNC_MEM=1` lets the core use block RAM
 > (ADR 0012). Both cores implement Zicsr with the machine-mode CSRs (`mcycle`, `minstret`,
 > `mtvec`, `mepc`, `mcause`, Xmlacc's `mlstat`, ...) and ecall/ebreak/illegal-instruction traps
-> (ADR 0014) and the machine timer interrupt (ADR 0015). All eight core configurations run
+> (ADR 0014), misaligned-access traps (ADR 0016) and the machine timer interrupt (ADR 0015). All eight core configurations run
 > under Icarus via cocotb and are checked
 > instruction-by-instruction against a Python ISS golden model (`model/iss/`), on directed tests,
 > the riscv-tests rv64ui + rv64um suites (65 tests), and seeded constrained-random programs. Not
