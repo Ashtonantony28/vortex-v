@@ -91,9 +91,9 @@ correctness failures — the full suite is green — but they're real and owned.
 
 ## Zicsr and traps (ADR 0014)
 - **I21:** machine mode only, and the only interrupt is the machine timer (ADR 0015): no
-  software or external interrupts, and `wfi` is a no-op.
-  Misaligned loads and stores neither work nor trap (riscv-tests `ma_data` stays excluded), and a
-  jump to a target that is not 4-byte aligned does not trap.
+  software or external interrupts, and `wfi` is a no-op. Misaligned loads and stores trap
+  instead of working (ADR 0016), so riscv-tests `ma_data` (which expects them to work) stays
+  excluded.
 - **I22 (verification gap):** `mcycle`/`cycle` reads are not checked against the ISS; the co-sim
   hands the ISS the RTL's value. A CSRRS/CSRRC that *writes* `mcycle` with a non-zero mask
   depends on that value too, so the random programs never generate one.
@@ -112,4 +112,8 @@ correctness failures — the full suite is green — but they're real and owned.
   and that everything after it matches the ISS, but not that the RTL takes it as early as it
   could: an interrupt delayed (not lost) by some cycles passes. `mip` reads come from the RTL,
   like `mcycle`.
+
+## Misaligned traps (ADR 0016)
+- **I27 (performance, by design):** a misaligned load, store or jump waits until it is the
+  oldest instruction and then flushes the whole out-of-order pipeline.
 

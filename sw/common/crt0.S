@@ -1,6 +1,7 @@
 # Vortex-V SoC start-up: set the stack, clear .bss, call main, report to tohost.
 # main's return value 0 means pass (tohost = 1); anything else fails with that code.
-# Any trap (ecall, ebreak, illegal instruction; ADR 0014) lands in trap_entry, which
+# Any trap (ecall, ebreak, illegal instruction, ADR 0014; misaligned load, store or
+# jump target, ADR 0016) lands in trap_entry, which
 # lights all four LEDs and fails with code 0x100 + mcause. A timer interrupt
 # (ADR 0015) instead calls irq_handler() and returns.
     .section .text.init

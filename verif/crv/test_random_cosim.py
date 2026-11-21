@@ -11,8 +11,9 @@ Run (from the repo root):  python3 -m pytest verif/crv/ -q
 More seeds:  VORTEX_RANDOM_SEEDS=0-499 python3 -m pytest verif/crv/ -q
 Xmlacc-heavy programs run on the configurations with a pipelined or second Xmlacc
 unit (test_random_cosim_xm_mix), where a squash can land on an op in flight.
-test_random_cosim_irq runs the programs with timer interrupts arriving every
-48-111 cycles (ADR 0015), on every configuration.
+test_random_cosim_traps runs the programs with timer interrupts arriving every
+48-111 cycles (ADR 0015) and some misaligned loads and stores that trap
+(ADR 0016), on every configuration.
 """
 import os
 import sys
@@ -41,12 +42,13 @@ MAX_RTL_CYCLES = 30_000          # ~400 instructions + ~65 cycles per divide
 
 def _run_on_iss(seed, mix="default", irq=False):
     from model.iss.rv64i import Hart, Memory
-    asm, data, stats = RandomProgram(seed, n_items=N_ITEMS, mix=MIXES[mix], irq=irq).build()
+    asm, data, stats = RandomProgram(seed, n_items=N_ITEMS, mix=MIXES[mix], irq=irq,
+                                     faults=irq).build()
     mem = Memory(base=RESET_PC)
     mem.load_words(asm.assemble(), base=RESET_PC)
     for addr, n, v in data:
         mem.store(addr, n, v)
-    hart = Hart(mem=mem, reset_pc=RESET_PC, tohost_addr=TOHOST_ADDR)
+    hart = Hart(mem=mem, reset_pc=RESET_PC, tohost_addr=TOHOST_ADDR, traps=irq)
     return hart.run(max_steps=MAX_ISS_STEPS), stats
 
 
@@ -97,9 +99,10 @@ if cocotb is not None:
         seeds = parse_seeds(os.environ.get("VORTEX_RANDOM_SEEDS", DEFAULT_SEEDS))
         mix = MIXES[os.environ.get("VORTEX_RANDOM_MIX", "default")]
         irq = os.environ.get("VORTEX_RANDOM_IRQ") == "1"
-        total = spec = mispredicts = irqs = 0
+        total = spec = mispredicts = irqs = faults = 0
         for seed in seeds:
-            asm, data, _ = RandomProgram(seed, n_items=N_ITEMS, mix=mix, irq=irq).build()
+            asm, data, _ = RandomProgram(seed, n_items=N_ITEMS, mix=mix, irq=irq,
+                                         faults=irq).build()
             retires, state, iss = await cosim_lockstep(
                 dut, f"seed{seed}", asm.assemble(), data=data,
                 max_cycles=MAX_RTL_CYCLES, mem_check=(DATA_BASE, DATA_SIZE))
@@ -109,12 +112,15 @@ if cocotb is not None:
                 assert count == len(state["irqs"]) > 0, \
                     f"seed{seed}: handler counted {count}, RTL took {len(state['irqs'])}"
                 irqs += count
+                faults += iss.mem.load(IRQ_SAVE + 24, 8)
             if hasattr(dut, "dbg_mispredicts"):
                 spec += int(dut.dbg_spec_branches.value)
                 mispredicts += int(dut.dbg_mispredicts.value)
         dut._log.info("random co-sim: %d seeds, %d retired instructions matched the ISS, "
                       "data region matched; %d predicted branches, %d mispredicts, "
-                      "%d interrupts", len(seeds), total, spec, mispredicts, irqs)
+                      "%d interrupts, %d misaligned faults", len(seeds), total, spec, mispredicts,
+                      irqs, faults)
+        assert not irq or faults > 0, "no misaligned access trapped"
 
 
 @pytest.mark.parametrize("toplevel", CORES)
@@ -139,7 +145,7 @@ def test_random_cosim_xm_mix(toplevel):
 
 
 @pytest.mark.parametrize("toplevel", CORES)
-def test_random_cosim_irq(toplevel):
+def test_random_cosim_traps(toplevel):
     build_and_test(toplevel, "test_random_cosim", HERE, extra_pythonpath=[CORE_DIR, ROOT],
                    env={"VORTEX_RANDOM_SEEDS": os.environ.get("VORTEX_RANDOM_SEEDS",
                                                               DEFAULT_SEEDS),

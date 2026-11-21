@@ -52,6 +52,15 @@ def _load_program(words, base=RESET_PC, data=None):
     return mem
 
 
+def _check_bus(dut, iaddr, daddr=None, nbytes=1):
+    """Bus-level property (ADR 0016): the cores never fetch from a pc that is not
+    4-byte aligned, and never put a misaligned load/store on the data port (it
+    traps instead)."""
+    assert iaddr % 4 == 0, f"fetch from misaligned pc {iaddr:#x}"
+    if daddr is not None:
+        assert daddr % nbytes == 0, f"misaligned {nbytes}-byte data access at {daddr:#x}"
+
+
 def _mmio_store(state, addr, data):
     """Side effects of a store: tohost ends the run, MTIMECMP sets the timer."""
     if addr == TOHOST_ADDR:
@@ -70,6 +79,8 @@ async def _mem_model(dut, mem, state):
     while not state["stop"]:
         await Timer(1, units="ns")                 # let pc / comb settle
         iaddr = _safe_int(dut.imem_addr, RESET_PC)
+        if _safe_int(dut.rst_n, 0) == 1:
+            _check_bus(dut, iaddr)
         dut.imem_rdata.value = _rd_word(mem, iaddr)
         if dual_fetch:                             # M1-INTERFACE v1.1 second fetch port
             dut.imem_rdata1.value = _rd_word(mem, _safe_int(dut.imem_addr1, RESET_PC + 4))
@@ -78,6 +89,7 @@ async def _mem_model(dut, mem, state):
             daddr = _safe_int(dut.dmem_addr, 0)
             size = _safe_int(dut.dmem_size, 0)
             nbytes = 1 << size
+            _check_bus(dut, 0, daddr, nbytes)
             if _safe_int(dut.dmem_we, 0) == 1:
                 data = _safe_int(dut.dmem_wdata, 0)
                 _wr_bytes(mem, daddr, nbytes, data)
@@ -101,12 +113,15 @@ async def _mem_model_sync(dut, mem, state):
         await FallingEdge(dut.clk)
         await Timer(1, units="ns")
         iaddr = _safe_int(dut.imem_addr, RESET_PC)
+        if _safe_int(dut.rst_n, 0) == 1:
+            _check_bus(dut, iaddr)
         cur = {"i0": _rd_word(mem, iaddr)}
         if dual_fetch:
             cur["i1"] = _rd_word(mem, _safe_int(dut.imem_addr1, RESET_PC + 4))
         if _safe_int(dut.rst_n, 0) == 1 and _safe_int(dut.dmem_req, 0) == 1:
             daddr = _safe_int(dut.dmem_addr, 0)
             nbytes = 1 << _safe_int(dut.dmem_size, 0)
+            _check_bus(dut, 0, daddr, nbytes)
             if _safe_int(dut.dmem_we, 0) == 1:
                 data = _safe_int(dut.dmem_wdata, 0)
                 _wr_bytes(mem, daddr, nbytes, data)
