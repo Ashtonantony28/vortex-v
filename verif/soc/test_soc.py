@@ -94,7 +94,8 @@ if cocotb is not None:
         assert lines[1] == ". mmio order ok", lines
         assert lines[2] == f"dot32 = {EXPECTED_DOT:016x} xmlacc ok", lines
         assert lines[3] == " csr ok", lines
-        assert lines[4].startswith("cycles = ") and int(lines[4][9:], 16) > 0, lines
+        assert lines[4] == " irq ok", lines
+        assert lines[5].startswith("cycles = ") and int(lines[5][9:], 16) > 0, lines
         assert int(dut.leds.value) == 0xA
 
 

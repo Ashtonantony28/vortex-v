@@ -90,7 +90,8 @@ correctness failures — the full suite is green — but they're real and owned.
   `SPEC_BRANCHES=1` a device load at the memory-queue head can still be on a wrong path.
 
 ## Zicsr and traps (ADR 0014)
-- **I21:** machine mode only, and no interrupts: `mie`/`mip` read as 0 and `wfi` is a no-op.
+- **I21:** machine mode only, and the only interrupt is the machine timer (ADR 0015): no
+  software or external interrupts, and `wfi` is a no-op.
   Misaligned loads and stores neither work nor trap (riscv-tests `ma_data` stays excluded), and a
   jump to a target that is not 4-byte aligned does not trap.
 - **I22 (verification gap):** `mcycle`/`cycle` reads are not checked against the ISS; the co-sim
@@ -103,4 +104,12 @@ correctness failures — the full suite is green — but they're real and owned.
   function called from `always_comb` in two instances of a module can make the two blocks
   retrigger each other forever (seen with `csr_legal` in the two decoders). Call such functions
   from a continuous assignment instead.
+
+## Timer interrupt (ADR 0015)
+- **I25 (performance, by design):** the out-of-order core takes an interrupt only once its ROB
+  has drained, so the latency is up to one full drain (a divide and a full ROB).
+- **I26 (verification gap):** the co-sim checks that each interrupt the RTL takes was enabled
+  and that everything after it matches the ISS, but not that the RTL takes it as early as it
+  could: an interrupt delayed (not lost) by some cycles passes. `mip` reads come from the RTL,
+  like `mcycle`.
 

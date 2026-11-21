@@ -1,6 +1,6 @@
 // Vortex-V SoC smoke test (ADR 0011): UART output, an int8 dot product on the
-// Xmlacc unit checked against plain C, CSRs (mlstat, instret), the LEDs, and the
-// cycle counter.
+// Xmlacc unit checked against plain C, CSRs (mlstat, instret), timer
+// interrupts, the LEDs, and the cycle counter.
 #include "vortex.h"
 
 #define N 32                              // int8 elements per vector
@@ -43,6 +43,28 @@ static int csr_ok(void) {
     return r == 127 && sat && clear && i1 > i0;
 }
 
+// Timer interrupt (ADR 0015): three ticks, each re-arming the timer, arrive
+// while main spins and computes; the work it does in between is not disturbed.
+#define TICKS 3
+static volatile int ticks;
+
+void irq_handler(void) {
+    if (++ticks < TICKS) timer_arm(300);
+    else timer_disarm();
+}
+
+static int irq_ok(void) {
+    ticks = 0;
+    timer_arm(200);
+    irq_enable();
+    uint64_t sum = 0;
+    for (uint64_t i = 1; ticks < TICKS && i < 100000; i++) sum += i * i;
+    irq_disable();
+    uint64_t n = 0, ref = 0;                 // recompute the same sum without interrupts
+    for (uint64_t i = 1; ref != sum && i < 100000; i++) { ref += i * i; n = i; }
+    return ticks == TICKS && ref == sum && n > 0;
+}
+
 int main(void) {
     uart_puts("Vortex-V SoC: hello\n");
     int order_ok = mmio_ordered();
@@ -65,6 +87,10 @@ int main(void) {
     int csr = csr_ok();
     uart_puts(csr ? " csr ok\n" : " csr BROKEN\n");
     ok = ok && csr;
+
+    int irq = irq_ok();
+    uart_puts(irq ? " irq ok\n" : " irq BROKEN\n");
+    ok = ok && irq;
 
     LEDS = ok ? 0xA : 0x5;
     uart_puts("cycles = ");

@@ -7,7 +7,8 @@
 #define UART_TX      (*(volatile uint64_t *)(MMIO_BASE + 0x00))
 #define UART_STATUS  (*(volatile uint64_t *)(MMIO_BASE + 0x08))
 #define LEDS         (*(volatile uint64_t *)(MMIO_BASE + 0x10))
-#define CYCLE        (*(volatile uint64_t *)(MMIO_BASE + 0x18))
+#define CYCLE        (*(volatile uint64_t *)(MMIO_BASE + 0x18))   // also mtime
+#define MTIMECMP     (*(volatile uint64_t *)(MMIO_BASE + 0x20))   // ADR 0015
 
 static inline void uart_putc(char c) {
     while (UART_STATUS & 1) { }
@@ -50,4 +51,17 @@ static inline uint64_t rdcycle(void)   { return CSR_READ(0xc00); }
 static inline uint64_t rdinstret(void) { return CSR_READ(0xc02); }
 static inline uint64_t mlstat_read(void) { return CSR_READ(0x801); }
 static inline void mlstat_clear(void)  { CSR_WRITE(0x801, 1); }   // SAT is write-1-to-clear
+
+// Machine timer interrupt (ADR 0015). The interrupt is pending while
+// CYCLE >= MTIMECMP; crt0 calls irq_handler(), which must re-arm or disarm
+// the timer (write MTIMECMP) before it returns, or it is taken again at once.
+#define CSR_SET(csr, v)   __asm__ volatile ("csrs " #csr ", %0" :: "r"((uint64_t)(v)))
+#define CSR_CLEAR(csr, v) __asm__ volatile ("csrc " #csr ", %0" :: "r"((uint64_t)(v)))
+#define MIE_MTIE      (1u << 7)
+#define MSTATUS_MIE   (1u << 3)
+void irq_handler(void);
+static inline void timer_arm(uint64_t delta) { MTIMECMP = CYCLE + delta; }
+static inline void timer_disarm(void)       { MTIMECMP = ~0ULL; }
+static inline void irq_enable(void)  { CSR_SET(0x304, MIE_MTIE); CSR_SET(0x300, MSTATUS_MIE); }
+static inline void irq_disable(void) { CSR_CLEAR(0x300, MSTATUS_MIE); }
 #endif
