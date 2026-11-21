@@ -41,6 +41,12 @@ harness serves and reads the extra ports only when the toplevel has them.
   `dbg1_wb_rd` [4:0], `dbg1_wb_data` [63:0]. In a cycle where both slots are valid, slot 0 is
   the older instruction. Slot 1 is never valid without slot 0. With `WIDTH=1` it stays 0.
 
+## v1.2 additive ports (ADR 0015, timer interrupt; both cores)
+- in `irq_timer`: the machine timer interrupt level (`mip.MTIP`), from the SoC's
+  `CYCLE >= MTIMECMP`. Drive it 0 when unused; the harness models MTIMECMP at `0x8000_1008`.
+- out `dbg_irq`: a one-cycle pulse, in the same cycle as the retire outputs, when an interrupt
+  was taken. No instruction retires in that cycle; the instruction at `mepc` retires later.
+
 ## Golden model contract (`model/iss/rv64i.py`)
 A pure-Python RV64I instruction-set simulator:
 - `step()` executes one instruction, returns a record `{pc, inst, rd, rd_val, mem}`.

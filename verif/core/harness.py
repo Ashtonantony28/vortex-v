@@ -9,7 +9,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, Timer
 
-from rvasm import MASK64, RESET_PC, TOHOST_ADDR
+from rvasm import MASK64, MTIMECMP_ADDR, RESET_PC, TOHOST_ADDR
 
 # ===========================================================================
 # Memory model + run harness
@@ -52,6 +52,15 @@ def _load_program(words, base=RESET_PC, data=None):
     return mem
 
 
+def _mmio_store(state, addr, data):
+    """Side effects of a store: tohost ends the run, MTIMECMP sets the timer."""
+    if addr == TOHOST_ADDR:
+        state["tohost"] = data & MASK64
+        state["halt"] = True
+    elif addr == MTIMECMP_ADDR:
+        state["mtimecmp"] = data & MASK64
+
+
 async def _mem_model(dut, mem, state):
     """Serve imem combinationally and handle the dmem port each cycle."""
     if os.environ.get("VORTEX_SYNC_MEM") == "1":
@@ -72,9 +81,7 @@ async def _mem_model(dut, mem, state):
             if _safe_int(dut.dmem_we, 0) == 1:
                 data = _safe_int(dut.dmem_wdata, 0)
                 _wr_bytes(mem, daddr, nbytes, data)
-                if daddr == TOHOST_ADDR:
-                    state["tohost"] = data & MASK64
-                    state["halt"] = True
+                _mmio_store(state, daddr, data)
             else:
                 dut.dmem_rdata.value = _rd_bytes(mem, daddr, nbytes)
         await RisingEdge(dut.clk)
@@ -103,9 +110,7 @@ async def _mem_model_sync(dut, mem, state):
             if _safe_int(dut.dmem_we, 0) == 1:
                 data = _safe_int(dut.dmem_wdata, 0)
                 _wr_bytes(mem, daddr, nbytes, data)
-                if daddr == TOHOST_ADDR:
-                    state["tohost"] = data & MASK64
-                    state["halt"] = True
+                _mmio_store(state, daddr, data)
             else:
                 cur["d"] = _rd_bytes(mem, daddr, nbytes)
         nxt = cur
@@ -125,17 +130,27 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
     state["mlstat_sat"] holds the final Xmlacc SAT sticky (dbg_mlstat_sat).
     state["cycles"] counts clock cycles from reset release to the end of the run.
 
+    Timer interrupt (ADR 0015): the harness models MTIMECMP at MTIMECMP_ADDR
+    (all ones after reset, so no interrupt unless a program writes it) and drives
+    irq_timer high, registered like the SoC, while the cycle count >= it. Each
+    dbg_irq pulse is recorded in state["irqs"] as the number of instructions
+    retired before it, so a co-sim can take it in the ISS at the same point.
+
     A fresh clock is started per call: cocotb cleans up scheduled coroutines
     between tests, so a shared clock would stop after the first test.
     """
     clk_task = cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     mem = _load_program(words, data=data)
-    state = {"halt": False, "tohost": None, "stop": False, "mlstat_sat": 0, "cycles": 0}
+    state = {"halt": False, "tohost": None, "stop": False, "mlstat_sat": 0, "cycles": 0,
+             "mtimecmp": MASK64, "irqs": []}
+    has_irq = hasattr(dut, "irq_timer")
 
     # Assert reset and initialise memory inputs
     dut.rst_n.value = 0
     dut.imem_rdata.value = 0
     dut.dmem_rdata.value = 0
+    if has_irq:
+        dut.irq_timer.value = 0
     two_slots = hasattr(dut, "dbg1_retire_valid")    # M1-INTERFACE v1.1 second retire slot
     if two_slots:
         dut.imem_rdata1.value = 0
@@ -152,6 +167,13 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
         await RisingEdge(dut.clk)
         await Timer(1, units="ns")
         state["cycles"] = cyc + 1
+        if has_irq:
+            # The level for the next edge: the SoC registers cycle >= mtimecmp.
+            dut.irq_timer.value = int(cyc >= state["mtimecmp"])
+            if _safe_int(dut.dbg_irq, 0) == 1:     # taken before this cycle's retires
+                state["irqs"].append(len(retires))
+                if debug:
+                    dut._log.info("interrupt taken after %d retires", len(retires))
         rv = _safe_int(dut.dbg_retire_valid, 0)
         if rv == 1:
             retires.append({
@@ -213,6 +235,16 @@ def _iss_module():
     return rv64i
 
 
+def _iss_take_irq(iss_mod, iss, name, i):
+    """Take the RTL's interrupt in the ISS. It must have been enabled (mstatus.MIE
+    and mie.MTIE); the ISS then traps exactly as the RTL should."""
+    assert iss.mstatus & iss_mod.MSTATUS_MIE, \
+        f"{name}[{i}]: RTL took an interrupt with mstatus.MIE clear"
+    assert iss.mie & iss_mod.MIE_MTIE, \
+        f"{name}[{i}]: RTL took an interrupt with mie.MTIE clear"
+    iss.take_interrupt()
+
+
 async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check=None):
     """Run `words` on the RTL and compare every retired instruction with the ISS.
 
@@ -234,12 +266,16 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
     retires, mem_rtl, state = await run_program(dut, words, max_cycles=max_cycles, data=data)
     assert state["tohost"] == 1, f"{name}: RTL tohost={state['tohost']} (expected PASS=1)"
 
+    irqs = list(state["irqs"])
     for i, rtl_rec in enumerate(retires):
+        while irqs and irqs[0] == i:
+            irqs.pop(0)
+            _iss_take_irq(iss_mod, iss, name, i)
         assert not iss.halted, \
             f"{name}[{i}]: RTL retired pc={rtl_rec['pc']:#x} after the tohost store"
-        # mcycle/cycle reads are taken from the RTL; the ISS cannot predict them
-        # (ADR 0014). The override is used only by an instruction that reads them.
-        iss.cycle_override = rtl_rec["data"]
+        # mcycle/cycle/mip reads are taken from the RTL; the ISS cannot predict
+        # them (ADR 0014/0015). Only an instruction that reads them uses it.
+        iss.read_override = rtl_rec["data"]
         rec = iss.step()
         iss_pc = rec["pc"] & MASK64
         iss_rd = rec.get("rd")
@@ -254,6 +290,7 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
                 f"{name}[{i}] pc={iss_pc:#x} rd RTL=x{rtl_rec['rd']} ISS=x{iss_rd}"
             assert rtl_rec["data"] == iss_val, \
                 f"{name}[{i}] pc={iss_pc:#x} x{iss_rd} RTL={rtl_rec['data']:#x} ISS={iss_val:#x}"
+    assert not irqs, f"{name}: interrupt taken after the last retire"
     assert iss.halted, f"{name}: ISS did not reach the tohost store after {len(retires)} retires"
     assert iss.halt_code == (True, 0), f"{name}: ISS halt_code={iss.halt_code}"
     assert bool(state["mlstat_sat"]) == bool(iss.mlstat & 1), \

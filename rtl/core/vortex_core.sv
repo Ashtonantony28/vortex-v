@@ -40,6 +40,8 @@ module vortex_core
   output logic [1:0]        dmem_size,
   output logic [XLEN-1:0]   dmem_wdata,
   input  logic [XLEN-1:0]   dmem_rdata,
+  // Machine timer interrupt level from the SoC (mtime >= mtimecmp; ADR 0015)
+  input  logic              irq_timer,
 
   // Debug / retire introspection (M1 co-sim oracle)
   output logic              dbg_retire_valid,
@@ -50,7 +52,9 @@ module vortex_core
 
   // Xmlacc mlstat.SAT sticky (CSR 0x801 bit 0), so the co-sim can check
   // requantize saturation against the ISS at the end of a run.
-  output logic              dbg_mlstat_sat
+  output logic              dbg_mlstat_sat,
+  // One-cycle pulse: an interrupt was taken (before the instruction at mepc)
+  output logic              dbg_irq
 );
 
   // ---------------------------------------------------------------------------
@@ -59,6 +63,9 @@ module vortex_core
   logic [XLEN-1:0] pc;
   logic            halted;
   logic            running;
+  // An interrupt is taken at an instruction boundary instead of executing the
+  // instruction at pc; never in the middle of a multi-cycle muldiv (ADR 0015).
+  logic            irq_pending, take_irq;
   assign running = !halted;
 
   // ---------------------------------------------------------------------------
@@ -189,12 +196,13 @@ module vortex_core
 
   // Start a new op the first cycle a muldiv instruction is present and the unit
   // is free; while it runs (or on its done cycle) `start` stays low.
-  assign md_start = running && is_muldiv && !md_busy && !md_done;
+  assign take_irq = running && irq_pending && !(is_muldiv && (md_busy || md_done));
+  assign md_start = running && is_muldiv && !md_busy && !md_done && !take_irq;
 
   // Stall the pipeline (hold pc, suppress retire/writeback) while a muldiv op is
   // in flight. The op retires on the single cycle `md_done` is asserted.
   logic md_stall;
-  assign md_stall = running && is_muldiv && !md_done;
+  assign md_stall = running && is_muldiv && !md_done && !take_irq;
 
   vortex_muldiv #(.XLEN(XLEN)) u_muldiv (
     .clk     (clk),
@@ -225,8 +233,8 @@ module vortex_core
   // illegal instruction like any other: every older one has retired.
   // ---------------------------------------------------------------------------
   logic            retiring, csr_exec, csr_redirect, csr_no_count, sat_set;
-  logic [XLEN-1:0] csr_rdata, csr_target;
-  assign retiring = running && !md_stall;
+  logic [XLEN-1:0] csr_rdata, csr_target, trap_vector;
+  assign retiring = running && !md_stall && !take_irq;
   assign csr_exec = retiring && (is_sys || dec_illegal);
   assign sat_set  = retiring && is_xmlacc && (xm_op == XM_RQS) && xm_sat;
 
@@ -245,7 +253,12 @@ module vortex_core
     .no_count   (csr_no_count),
     .retire_cnt (2'(retiring && !csr_no_count)),
     .sat_set    (sat_set),
-    .mlstat_sat (dbg_mlstat_sat)
+    .mlstat_sat (dbg_mlstat_sat),
+    .irq_timer  (irq_timer),
+    .irq_pending(irq_pending),
+    .irq_take   (take_irq),
+    .irq_pc     (pc),
+    .trap_vector(trap_vector)
   );
 
   // ---------------------------------------------------------------------------
@@ -256,7 +269,9 @@ module vortex_core
   assign jalr_target = (rs1_data + imm) & ~64'd1; // LSB cleared per spec
 
   always_comb begin
-    if (csr_redirect) begin
+    if (take_irq) begin
+      next_pc = trap_vector;                      // interrupt -> mtvec
+    end else if (csr_redirect) begin
       next_pc = csr_target;                       // trap -> mtvec, mret -> mepc
     end else if (is_jal) begin
       next_pc = pc + imm;
@@ -272,8 +287,8 @@ module vortex_core
   // ---------------------------------------------------------------------------
   // Data memory interface (combinational outputs for this cycle)
   // ---------------------------------------------------------------------------
-  assign dmem_req   = running && (is_load || is_store);
-  assign dmem_we    = running && is_store;
+  assign dmem_req   = running && !take_irq && (is_load || is_store);
+  assign dmem_we    = running && !take_irq && is_store;
   assign dmem_addr  = alu_y;             // rs1 + imm
   assign dmem_size  = mem_size;
   assign dmem_wdata = rs2_data;          // right-justified; TB writes mem_size bytes
@@ -303,12 +318,13 @@ module vortex_core
   end
 
   // Actual architectural register write enable (x0 handled in regfile).
-  // Suppressed while a muldiv op is stalling; it fires on the op's done cycle.
-  assign rf_we = running && reg_we && !md_stall;
+  // Suppressed while a muldiv op is stalling (it fires on the op's done cycle)
+  // and when an interrupt is taken instead.
+  assign rf_we = retiring && reg_we;
 
   // tohost halt detection: a committed store to TOHOST_ADDR
   logic tohost_store;
-  assign tohost_store = running && is_store && (dmem_addr == TOHOST_ADDR);
+  assign tohost_store = dmem_we && (dmem_addr == TOHOST_ADDR);
 
   // ---------------------------------------------------------------------------
   // Commit / retire (registered)
@@ -322,15 +338,24 @@ module vortex_core
       dbg_wb_valid     <= 1'b0;
       dbg_wb_rd        <= '0;
       dbg_wb_data      <= '0;
+      dbg_irq          <= 1'b0;
     end else if (halted) begin
       dbg_retire_valid <= 1'b0;
       dbg_wb_valid     <= 1'b0;
+      dbg_irq          <= 1'b0;
+    end else if (take_irq) begin
+      // Interrupt: nothing retires; continue at mtvec (ADR 0015).
+      pc               <= next_pc;
+      dbg_retire_valid <= 1'b0;
+      dbg_wb_valid     <= 1'b0;
+      dbg_irq          <= 1'b1;
     end else if (md_stall) begin
       // A multi-cycle muldiv op is still running: hold pc, emit no retire pulse
       // this cycle. The op retires once on the cycle md_done is asserted (then
       // md_stall is low and the normal commit path below runs).
       dbg_retire_valid <= 1'b0;
       dbg_wb_valid     <= 1'b0;
+      dbg_irq          <= 1'b0;
     end else begin
       // commit the instruction currently decoded at pc
       pc               <= next_pc;
@@ -339,6 +364,7 @@ module vortex_core
       dbg_wb_valid     <= reg_we && (rd_addr != 5'd0);
       dbg_wb_rd        <= rd_addr;
       dbg_wb_data      <= (reg_we && (rd_addr != 5'd0)) ? wb_data : '0;
+      dbg_irq          <= 1'b0;
       if (tohost_store) begin
         halted <= 1'b1;
       end

@@ -9,7 +9,9 @@
 //   MMIO_BASE + 0x00  W      UART_TX: send the low byte (ignored while busy)
 //   MMIO_BASE + 0x08  R      UART_STATUS: bit 0 = transmitter busy
 //   MMIO_BASE + 0x10  RW     LEDS: bits 3:0
-//   MMIO_BASE + 0x18  R      CYCLE: cycles since reset
+//   MMIO_BASE + 0x18  R      CYCLE: cycles since reset (also mtime)
+//   MMIO_BASE + 0x20  RW     MTIMECMP: machine timer interrupt while CYCLE >= MTIMECMP
+//                            (resets to all ones; ADR 0015)
 // Other addresses read 0 and ignore writes.
 //
 // MMIO reads have no side effects, so speculative loads may read them safely
@@ -42,12 +44,13 @@ module vortex_soc
   output logic       pass        // ... and the value was 1
 );
   localparam int unsigned RAMW       = $clog2(RAM_BYTES);
-  localparam int unsigned MMIO_SPAN  = 32;
+  localparam int unsigned MMIO_SPAN  = 64;
   localparam int unsigned MMW        = $clog2(MMIO_SPAN);
-  localparam logic [MMW-1:0] REG_UART_TX     = MMW'(5'h00);
-  localparam logic [MMW-1:0] REG_UART_STATUS = MMW'(5'h08);
-  localparam logic [MMW-1:0] REG_LEDS        = MMW'(5'h10);
-  localparam logic [MMW-1:0] REG_CYCLE       = MMW'(5'h18);
+  localparam logic [MMW-1:0] REG_UART_TX     = MMW'(6'h00);
+  localparam logic [MMW-1:0] REG_UART_STATUS = MMW'(6'h08);
+  localparam logic [MMW-1:0] REG_LEDS        = MMW'(6'h10);
+  localparam logic [MMW-1:0] REG_CYCLE       = MMW'(6'h18);   // also mtime (ADR 0015)
+  localparam logic [MMW-1:0] REG_MTIMECMP    = MMW'(6'h20);   // timer IRQ when CYCLE >= this
   localparam logic [XLEN-1:0] TOHOST_PASS    = XLEN'(1);
 
   initial begin
@@ -62,6 +65,8 @@ module vortex_soc
   logic [31:0]     imem_rdata, imem_rdata1;
   logic            dmem_req, dmem_we;
   logic [XLEN-1:0] dmem_addr, dmem_wdata, dmem_rdata;
+  logic            timer_irq;   // registered CYCLE >= MTIMECMP (ADR 0015)
+  logic [XLEN-1:0] mtimecmp;
   logic [1:0]      dmem_size;
 
   // The debug/retire ports are for the co-sim harness; the SoC leaves them open.
@@ -90,6 +95,8 @@ module vortex_soc
       .dmem_size         (dmem_size),
       .dmem_wdata        (dmem_wdata),
       .dmem_rdata        (dmem_rdata),
+      .irq_timer         (timer_irq),
+      .dbg_irq           (),
       .dbg_retire_valid  (),
       .dbg_retire_pc     (),
       .dbg_wb_valid      (),
@@ -118,6 +125,8 @@ module vortex_soc
       .dmem_size        (dmem_size),
       .dmem_wdata       (dmem_wdata),
       .dmem_rdata       (dmem_rdata),
+      .irq_timer        (timer_irq),
+      .dbg_irq          (),
       .dbg_retire_valid (),
       .dbg_retire_pc    (),
       .dbg_wb_valid     (),
@@ -182,6 +191,7 @@ module vortex_soc
       REG_UART_STATUS: mmio_rdata = XLEN'(tx_busy);
       REG_LEDS:        mmio_rdata = XLEN'(led_q);
       REG_CYCLE:       mmio_rdata = cycle;
+      REG_MTIMECMP:    mmio_rdata = mtimecmp;
       default:         mmio_rdata = '0;
     endcase
   end
@@ -203,10 +213,14 @@ module vortex_soc
     if (!rst_n) begin
       cycle <= '0;
       led_q <= '0;
+      mtimecmp  <= '1;          // no interrupt until software sets it
+      timer_irq <= 1'b0;
       done  <= 1'b0;
       pass  <= 1'b0;
     end else begin
       cycle <= cycle + XLEN'(1);
+      timer_irq <= (cycle >= mtimecmp);
+      if (dmem_req && dmem_we && sel_mmio && (reg_off == REG_MTIMECMP)) mtimecmp <= dmem_wdata;
       if (dmem_req && dmem_we && sel_mmio && (reg_off == REG_LEDS)) led_q <= dmem_wdata[3:0];
       if (dmem_req && dmem_we && (dmem_addr == TOHOST_ADDR) && !done) begin
         done <= 1'b1;

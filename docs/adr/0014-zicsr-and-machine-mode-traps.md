@@ -1,6 +1,6 @@
 # 0014. Zicsr and machine-mode traps, serialized at the ROB head
 
-- **Status:** Accepted
+- **Status:** Accepted (the `mie`/`mip` row and "no interrupts" superseded by 0015)
 - **Date:** 2026-11-19
 
 ## Context

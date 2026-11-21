@@ -72,6 +72,9 @@ module vortex_ooo_core
   output logic [XLEN-1:0]   dmem_wdata,
   input  logic [XLEN-1:0]   dmem_rdata,
 
+  // Machine timer interrupt level from the SoC (mtime >= mtimecmp; ADR 0015)
+  input  logic              irq_timer,
+
   // Debug / retire introspection (driven at commit)
   output logic              dbg_retire_valid,
   output logic [XLEN-1:0]   dbg_retire_pc,
@@ -79,6 +82,7 @@ module vortex_ooo_core
   output logic [4:0]        dbg_wb_rd,
   output logic [XLEN-1:0]   dbg_wb_data,
   output logic              dbg_mlstat_sat,
+  output logic              dbg_irq,          // pulse: an interrupt was taken
 
   // v1.1: second retire slot (younger than slot 0 in the same cycle; WIDTH=2 only)
   output logic              dbg1_retire_valid,
@@ -438,8 +442,15 @@ module vortex_ooo_core
 
   logic squash;   // a predicted branch resolved the other way this cycle
 
+  // Timer interrupt (ADR 0015): taken with nothing in flight, so no instruction
+  // is half done and pc is the next instruction in program order.
+  logic            irq_pending, take_irq;
+  logic [XLEN-1:0] trap_vector;
+  assign take_irq = irq_pending && (rob_count == '0) && !halted;
+
   logic dispatch;
-  assign dispatch = !halted && !fe_wait && !squash
+  // A pending interrupt stops dispatch; it is taken once the ROB has drained.
+  assign dispatch = !halted && !fe_wait && !squash && !irq_pending
                  && !(d_spec0 && spec_active)   // one predicted branch at a time
                  && (rob_count != (RW+1)'(ROB_DEPTH))
                  && iq_has_free
@@ -590,7 +601,12 @@ module vortex_ooo_core
     .no_count   (csr_no_count),
     .retire_cnt (retire_cnt),
     .sat_set    (sat_set),
-    .mlstat_sat (dbg_mlstat_sat)
+    .mlstat_sat (dbg_mlstat_sat),
+    .irq_timer  (irq_timer),
+    .irq_pending(irq_pending),
+    .irq_take   (take_irq),
+    .irq_pc     (pc),
+    .trap_vector(trap_vector)
   );
 
   logic redirect;
@@ -985,6 +1001,7 @@ module vortex_ooo_core
       else if (p1_taken)   pc_n = p1_pc + p1_imm;
     end
     if (squash) pc_n = squash_pc;
+    if (take_irq) pc_n = trap_vector;   // nothing in flight: no other source this cycle
   end
 
   // ---------------------------------------------------------------------------
@@ -1078,6 +1095,7 @@ module vortex_ooo_core
       sys_skip            <= 1'b0;
       dbg_ooo_completions <= '0;
       dbg_dual_commits    <= '0;
+      dbg_irq             <= 1'b0;
       dbg_spec_branches   <= '0;
       dbg_mispredicts     <= '0;
       dbg_lsq_forwards    <= '0;
@@ -1105,6 +1123,9 @@ module vortex_ooo_core
       dbg1_wb_rd          <= '0;
       dbg1_wb_data        <= '0;
     end else begin
+      dbg_irq <= take_irq;
+      if (take_irq) pc <= pc_n;
+
       // ---- Dispatch: rename, allocate ROB / IQ / memory-queue entries ----
       if (dispatch) begin
         pc <= pc_n;

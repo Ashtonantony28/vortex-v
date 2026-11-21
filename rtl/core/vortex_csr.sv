@@ -16,6 +16,12 @@
 // saturating mlacc.rqs retires; CSRRW and CSRRS clear the bits set in the
 // source operand, CSRRC does nothing (XMLACC-SPEC-v1).
 //
+// Timer interrupt (ADR 0015): `irq_timer` is the SoC's level (mtime >= mtimecmp),
+// read back as mip.MTIP. `irq_pending` = MTIP && mie.MTIE && mstatus.MIE. The
+// core decides when to take it (`irq_take`, at an instruction boundary with no
+// instruction executing) and gives the pc of the next instruction (`irq_pc`);
+// it then fetches from `trap_vector`.
+//
 // Reset is asynchronous, like the cores that instantiate it.
 `ifndef VORTEX_CSR_SV
 `define VORTEX_CSR_SV
@@ -41,7 +47,13 @@ module vortex_csr
   // Retirement and Xmlacc status
   input  logic [1:0]      retire_cnt,
   input  logic            sat_set,
-  output logic            mlstat_sat
+  output logic            mlstat_sat,
+  // Timer interrupt (ADR 0015)
+  input  logic            irq_timer,
+  output logic            irq_pending,
+  input  logic            irq_take,
+  input  logic [XLEN-1:0] irq_pc,
+  output logic [XLEN-1:0] trap_vector
 );
   localparam logic [XLEN-1:0] ALIGN_MASK = ~XLEN'(3);   // mtvec/mepc: IALIGN = 32
   localparam logic [XLEN-1:0] MSTATUS_WMASK = (XLEN'(1) << MSTATUS_MIE_BIT)
@@ -50,6 +62,7 @@ module vortex_csr
   logic [XLEN-1:0] mstatus_r, mtvec_r, mscratch_r, mepc_r, mcause_r, mtval_r;
   logic [XLEN-1:0] mcycle_r, minstret_r;
   logic            mlstat_r;
+  logic            mtie_r;
 
   // ---- Decode the access ----
   logic [11:0]     csr;
@@ -77,7 +90,9 @@ module vortex_csr
       CSR_MCYCLE, CSR_CYCLE       : rdata = mcycle_r;
       CSR_MINSTRET, CSR_INSTRET   : rdata = minstret_r;
       CSR_MLSTAT                  : rdata = XLEN'(mlstat_r);
-      default                     : rdata = '0;   // mie, mip, mlcfg, ID registers
+      CSR_MIE                     : rdata = XLEN'(mtie_r)    << IRQ_M_TIMER;
+      CSR_MIP                     : rdata = XLEN'(irq_timer) << IRQ_M_TIMER;
+      default                     : rdata = '0;   // mlcfg, ID registers
     endcase
   end
 
@@ -100,6 +115,9 @@ module vortex_csr
   assign target   = trap ? mtvec_r : mepc_r;
   assign no_count = trap || wr_minstret;
 
+  assign irq_pending = irq_timer && mtie_r && mstatus_r[MSTATUS_MIE_BIT];
+  assign trap_vector = mtvec_r;
+
   // ---- State ----
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -112,6 +130,7 @@ module vortex_csr
       mcycle_r   <= '0;
       minstret_r <= '0;
       mlstat_r   <= 1'b0;
+      mtie_r     <= 1'b0;
     end else begin
       mcycle_r   <= wr_mcycle   ? wval : (mcycle_r + XLEN'(1));
       minstret_r <= wr_minstret ? wval : (minstret_r + XLEN'(retire_cnt));
@@ -124,7 +143,8 @@ module vortex_csr
           CSR_MEPC    : mepc_r     <= wval & ALIGN_MASK;
           CSR_MCAUSE  : mcause_r   <= wval;
           CSR_MTVAL   : mtval_r    <= wval;
-          default     : ;                     // misa, mie, mip, mlcfg, counters, mlstat
+          CSR_MIE     : mtie_r     <= wval[IRQ_M_TIMER];
+          default     : ;                     // misa, mip, mlcfg, counters, mlstat
         endcase
       end
 
@@ -139,6 +159,14 @@ module vortex_csr
         mcause_r  <= illegal ? XLEN'(CAUSE_ILLEGAL)
                    : (op == SYS_EBREAK) ? XLEN'(CAUSE_BREAKPOINT) : XLEN'(CAUSE_ECALL_M);
         mtval_r   <= illegal ? XLEN'(inst) : '0;
+        mstatus_r <= XLEN'(MSTATUS_MPP_M)
+                   | (XLEN'(mstatus_r[MSTATUS_MIE_BIT]) << MSTATUS_MPIE_BIT);
+      end
+      // The core never takes an interrupt in a cycle where an instruction executes.
+      if (irq_take) begin
+        mepc_r    <= irq_pc & ALIGN_MASK;
+        mcause_r  <= XLEN'(CAUSE_M_TIMER_IRQ);
+        mtval_r   <= '0;
         mstatus_r <= XLEN'(MSTATUS_MPP_M)
                    | (XLEN'(mstatus_r[MSTATUS_MIE_BIT]) << MSTATUS_MPIE_BIT);
       end

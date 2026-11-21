@@ -11,12 +11,19 @@ Register roles: x1..x27 random sources/destinations (plus occasional x0
 destinations), x28 scratch for JALR targets, x29 loop counter, x30 data base,
 x31 tohost pointer.
 
+With irq=True (ADR 0015) the program also takes timer interrupts: a prologue
+enables them and arms the core harness's MTIMECMP, and a handler after the
+tohost store re-arms it a pseudo-random number of cycles ahead (from mcycle)
+and counts interrupts. x27 is then the handler's own register, so random code
+never uses it; the handler saves and restores everything else it touches.
+
 The same seed always yields the same program, so a failing seed reproduces.
 """
 import random
 from collections import Counter
 
-from rvasm import Asm, CODE_LIMIT, DATA_BASE, DATA_SIZE, MASK64, RESET_PC, TOHOST_ADDR
+from rvasm import (Asm, CODE_LIMIT, DATA_BASE, DATA_SIZE, MASK64, MTIMECMP_ADDR, RESET_PC,
+                   TOHOST_ADDR)
 
 POOL = list(range(1, 28))
 R_SCRATCH, R_LOOP, R_BASE, R_TOHOST = 28, 29, 30, 31
@@ -39,6 +46,13 @@ STORES = {"sb": 1, "sh": 2, "sw": 4, "sd": 8}
 BRANCHES = ["beq", "bne", "blt", "bge", "bltu", "bgeu"]
 
 CSR_MSCRATCH, CSR_MLSTAT = 0x340, 0x801
+CSR_MSTATUS, CSR_MIE, CSR_MTVEC, CSR_MCYCLE = 0x300, 0x304, 0x305, 0xB00
+MSTATUS_MIE, MIE_MTIE = 1 << 3, 1 << 7
+# Interrupt mode: the handler's register, its save area (outside the checked data
+# region) and how far ahead it re-arms the timer: IRQ_GAP_MIN + (mcycle & IRQ_GAP_MASK).
+R_IRQ = 27
+IRQ_SAVE = TOHOST_ADDR + 0x40          # +0 x28, +8 x26, +16 interrupt count
+IRQ_FIRST, IRQ_GAP_MIN, IRQ_GAP_MASK = 40, 48, 63   # the gap outlasts the handler
 # CSRs the random programs read (ADR 0014): mscratch, minstret, instret, mlstat,
 # mcycle, cycle, misa, mhartid.
 CSR_READS = [0x340, 0xB02, 0xC02, 0x801, 0xB00, 0xC00, 0x301, 0xF14]
@@ -74,11 +88,13 @@ def _interesting64(rng):
 class RandomProgram:
     """One random program. build() returns (Asm, data, stats)."""
 
-    def __init__(self, seed, n_items=180, mix=None):
+    def __init__(self, seed, n_items=180, mix=None, irq=False):
         self.seed = seed
         self.rng = random.Random(seed)
         self.n_items = n_items
         self.mix = dict(mix or DEFAULT_MIX)
+        self.irq = irq
+        self.pool = [r for r in POOL if not (irq and r == R_IRQ)]
         self.stats = Counter()
         self._label_n = 0
         self._recent_st = []      # offsets of the last few stores, for aliasing
@@ -90,10 +106,10 @@ class RandomProgram:
 
     def _src(self):
         # Mostly pool registers; sometimes x0, which reads as zero.
-        return 0 if self.rng.random() < 0.05 else self.rng.choice(POOL)
+        return 0 if self.rng.random() < 0.05 else self.rng.choice(self.pool)
 
     def _dst(self):
-        return 0 if self.rng.random() < 0.03 else self.rng.choice(POOL)
+        return 0 if self.rng.random() < 0.03 else self.rng.choice(self.pool)
 
     def _imm12(self):
         r = self.rng.random()
@@ -217,19 +233,55 @@ class RandomProgram:
         else:
             self._emit_simple(a)
 
+    # -- timer interrupts (ADR 0015) -----------------------------------------
+    def _irq_prologue(self, a):
+        """mtvec = handler, mie.MTIE, first interrupt IRQ_FIRST cycles from now, MIE."""
+        a.la_label(R_IRQ, "irq_handler")
+        a.csrw(CSR_MTVEC, R_IRQ)
+        a.addi(R_IRQ, 0, MIE_MTIE)
+        a.csrw(CSR_MIE, R_IRQ)
+        a.csrr(R_IRQ, CSR_MCYCLE)
+        a.addi(R_IRQ, R_IRQ, IRQ_FIRST)
+        a.la(R_SCRATCH, MTIMECMP_ADDR)
+        a.sd(R_IRQ, R_SCRATCH, 0)
+        a.csrrsi(0, CSR_MSTATUS, MSTATUS_MIE)
+
+    def _irq_handler(self, a):
+        """Count the interrupt and re-arm the timer; every register but x27 survives."""
+        a.label("irq_handler")
+        a.la(R_IRQ, IRQ_SAVE)
+        a.sd(R_SCRATCH, R_IRQ, 0)
+        a.sd(26, R_IRQ, 8)
+        a.ld(26, R_IRQ, 16)
+        a.addi(26, 26, 1)
+        a.sd(26, R_IRQ, 16)
+        a.csrr(R_SCRATCH, CSR_MCYCLE)
+        a.andi(26, R_SCRATCH, IRQ_GAP_MASK)
+        a.add(R_SCRATCH, R_SCRATCH, 26)
+        a.addi(R_SCRATCH, R_SCRATCH, IRQ_GAP_MIN)
+        a.la(26, MTIMECMP_ADDR)
+        a.sd(R_SCRATCH, 26, 0)
+        a.ld(R_SCRATCH, R_IRQ, 0)
+        a.ld(26, R_IRQ, 8)
+        a.mret()
+
     # -- whole program -----------------------------------------------------
     def build(self):
         a = Asm()
         data_vals = [_interesting64(self.rng) for _ in range(DATA_SIZE // 8)]
         data = [(DATA_BASE + 8 * i, 8, v) for i, v in enumerate(data_vals)]
         a.la(R_BASE, DATA_BASE)
-        for i, r in enumerate(POOL):
+        for i, r in enumerate(self.pool):
             a.ld(r, R_BASE, 8 * i)
+        if self.irq:
+            self._irq_prologue(a)
         for _ in range(self.n_items):
             self._emit_item(a)
         a.la(R_TOHOST, TOHOST_ADDR)
         a.addi(R_SCRATCH, 0, 1)
         a.sw(R_SCRATCH, R_TOHOST, 0)
+        if self.irq:
+            self._irq_handler(a)
         words = a.assemble()
         assert len(words) <= MAX_WORDS, \
             f"seed {self.seed}: {len(words)} words overflows the code region ({MAX_WORDS})"

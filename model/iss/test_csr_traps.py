@@ -33,11 +33,11 @@ def test_field_masks_and_ignored_csrs():
               csr(1, 0, 0x305, 1), csr(2, 3, 0x305, 0),     # mtvec
               csr(1, 0, 0x341, 1), csr(2, 4, 0x341, 0),     # mepc
               csr(1, 0, 0x301, 0), csr(2, 5, 0x301, 0),     # misa: write ignored
-              csr(1, 0, 0x304, 1), csr(2, 6, 0x304, 0)])    # mie: reads 0
+              csr(1, 0, 0x304, 1), csr(2, 6, 0x304, 0)])    # mie: MTIE only
     run(h, 11)
     assert h.x[2] == MSTATUS_MPP_M | MSTATUS_MPIE | MSTATUS_MIE
     assert h.x[3] == h.x[4] == (1 << 64) - 4
-    assert h.x[5] == MISA_VALUE and h.x[6] == 0
+    assert h.x[5] == MISA_VALUE and h.x[6] == 1 << 7   # mie: only MTIE (ADR 0015)
 
 
 def test_minstret_counts_retired_and_write_is_not_counted():
@@ -100,6 +100,26 @@ def test_wfi_is_a_nop_and_without_traps_bad_encodings_raise():
 
 def test_mcycle_read_uses_the_cosim_override():
     h = hart([csr(2, 1, 0xC00, 0)])
-    h.cycle_override = 1234
+    h.read_override = 1234
     h.step()
     assert h.x[1] == 1234
+
+
+def test_timer_interrupt_and_mie():
+    from rv64i import CAUSE_INTERRUPT, MIE_MTIE
+    h = hart([addi(1, 0, -1), csr(1, 0, 0x304, 1), csr(2, 2, 0x304, 0), addi(3, 0, 3)])
+    h.mtvec = RESET_PC + 0x100
+    h.mstatus |= MSTATUS_MIE
+    run(h, 3)
+    assert h.x[2] == MIE_MTIE                 # only MTIE is writable
+    rec = h.take_interrupt()
+    assert rec["irq"] == CAUSE_INTERRUPT | 7 and rec["pc"] == RESET_PC + 12
+    assert h.mepc == RESET_PC + 12 and h.mcause == CAUSE_INTERRUPT | 7 and h.mtval == 0
+    assert h.pc == RESET_PC + 0x100 and h.mstatus == MSTATUS_MPP_M | MSTATUS_MPIE
+
+
+def test_mip_read_uses_the_cosim_override():
+    h = hart([csr(2, 1, 0x344, 0)])
+    h.read_override = 0xFFFF
+    h.step()
+    assert h.x[1] == 1 << 7

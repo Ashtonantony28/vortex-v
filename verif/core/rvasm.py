@@ -8,6 +8,9 @@ generator) and anything else that needs to build programs in Python.
 XLEN        = 64
 RESET_PC    = 0x8000_0000
 TOHOST_ADDR = 0x8000_1000
+# The core harness models a timer compare register here (ADR 0015): the core's
+# irq_timer input is high while the cycle count >= the last value stored to it.
+MTIMECMP_ADDR = 0x8000_1008
 DATA_BASE   = 0x8000_2000
 DATA_SIZE   = 0x1000        # data region [DATA_BASE, DATA_BASE+DATA_SIZE)
 CODE_LIMIT  = TOHOST_ADDR   # programs at RESET_PC must end below tohost
@@ -231,6 +234,8 @@ class Asm:
     def csrrci(self, rd, csr, zimm):  return self._csr(0x7, rd, csr, zimm)
     def csrr(self, rd, csr):          return self.csrrs(rd, csr, 0)
     def csrw(self, csr, rs1):         return self.csrrw(0, csr, rs1)
+    def csrs(self, csr, rs1):         return self.csrrs(0, csr, rs1)
+    def csrc(self, csr, rs1):         return self.csrrc(0, csr, rs1)
     def ecall(self):                  return self._emit(lambda pc, L: 0x00000073)
     def ebreak(self):                 return self._emit(lambda pc, L: 0x00100073)
     def mret(self):                   return self._emit(lambda pc, L: 0x30200073)

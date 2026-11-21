@@ -62,6 +62,10 @@ MISA_VALUE = (2 << 62) | (1 << 8) | (1 << 12) | (1 << 23)   # RV64, I, M, X
 MSTATUS_MIE, MSTATUS_MPIE = 1 << 3, 1 << 7
 MSTATUS_MPP_M = 3 << 11
 CAUSE_ILLEGAL, CAUSE_BREAKPOINT, CAUSE_ECALL_M = 2, 3, 11
+# Machine timer interrupt (ADR 0015): mie.MTIE / mip.MTIP are bit 7.
+IRQ_M_TIMER = 7
+CAUSE_INTERRUPT = 1 << 63
+MIE_MTIE = 1 << IRQ_M_TIMER
 INST_ECALL, INST_EBREAK, INST_MRET, INST_WFI = 0x00000073, 0x00100073, 0x30200073, 0x10500073
 
 
@@ -216,8 +220,9 @@ class Hart:
         self.tohost_addr = tohost_addr
         self.ecall_halts = ecall_halts
         self.traps = traps
-        # Co-sim hook: the RTL's mcycle value for this step (the ISS cannot know it).
-        self.cycle_override: int | None = None
+        # Co-sim hook: the RTL's value for this step's read of a CSR the ISS cannot
+        # predict (mcycle/cycle, and mip, whose MTIP bit follows the SoC timer).
+        self.read_override: int | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -234,6 +239,7 @@ class Hart:
         self.mtvec = self.mscratch = self.mepc = self.mcause = self.mtval = 0
         self.mcycle = 0
         self.minstret = 0
+        self.mie = 0
 
     @property
     def mlstat_sat(self) -> bool:
@@ -376,6 +382,16 @@ class Hart:
                 raise
             return self._trap(pc, inst, CAUSE_ILLEGAL, inst)
 
+    def take_interrupt(self, code: int = IRQ_M_TIMER) -> dict:
+        """Take an interrupt before the instruction at pc (ADR 0015). The co-sim calls
+        this when the RTL reports one; the ISS does not model when interrupts arrive."""
+        pc = self.pc & MASK64
+        rec = self._trap(pc, 0, CAUSE_INTERRUPT | code, 0)
+        self.inst_count -= 1               # not an instruction
+        del rec["trap"]
+        rec["irq"] = CAUSE_INTERRUPT | code
+        return rec
+
     def _trap(self, pc: int, inst: int, cause: int, tval: int) -> dict:
         """Take a synchronous trap: no register write, not counted in minstret."""
         self.mepc = pc & ~3 & MASK64
@@ -405,12 +421,16 @@ class Hart:
         if csr == CSR_MTVAL:
             return self.mtval
         if csr in (CSR_MCYCLE, CSR_CYCLE):
-            return self.mcycle if self.cycle_override is None else u64(self.cycle_override)
+            return self.mcycle if self.read_override is None else u64(self.read_override)
+        if csr == CSR_MIP:
+            return 0 if self.read_override is None else u64(self.read_override) & MIE_MTIE
+        if csr == CSR_MIE:
+            return self.mie
         if csr in (CSR_MINSTRET, CSR_INSTRET):
             return self.minstret
         if csr == CSR_MLSTAT:
             return self.mlstat
-        return 0   # mie, mip, mlcfg, the ID registers
+        return 0   # mlcfg, the ID registers
 
     def _csr_write(self, csr: int, op: int, src: int, old: int) -> bool:
         """Apply a CSR write. Returns True if it wrote minstret (ADR 0014 item 3)."""
@@ -436,7 +456,9 @@ class Hart:
         elif csr == CSR_MINSTRET:
             self.minstret = new
             return True
-        return False                       # misa, mie, mip, mlcfg: writes ignored
+        elif csr == CSR_MIE:
+            self.mie = new & MIE_MTIE
+        return False                       # misa, mip, mlcfg: writes ignored
 
     def _exec(self, pc: int, inst: int) -> dict:
         no_count = False                   # this instruction wrote minstret
