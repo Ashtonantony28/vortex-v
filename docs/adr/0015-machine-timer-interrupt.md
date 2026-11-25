@@ -1,6 +1,6 @@
 # 0015. Machine timer interrupt, taken with the pipeline drained
 
-- **Status:** Accepted
+- **Status:** Accepted (decisions 1 and 3 amended by 0017: the machine external interrupt)
 - **Date:** 2026-11-21
 
 ## Context

@@ -43,6 +43,7 @@ module arty_a7_top #(
   );
 
   logic done, pass;
+  /* verilator lint_off PINCONNECTEMPTY */
   vortex_soc #(
     .CORE_OOO      (CORE_OOO),
     .WIDTH         (WIDTH),
@@ -58,9 +59,12 @@ module arty_a7_top #(
     .rst_n   (rst_n),
     .uart_tx (uart_rxd_out),
     .leds    (led),
+    .cap_in  ('0),         // capture/compare timer is off on the board for now (ADR 0017)
+    .cmp_out (),
     .done    (done),
     .pass    (pass)
   );
+  /* verilator lint_on PINCONNECTEMPTY */
 
   assign led0_g = done && pass;
   assign led0_r = done && !pass;

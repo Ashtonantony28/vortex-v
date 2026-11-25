@@ -9,7 +9,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, Timer
 
-from rvasm import MASK64, MTIMECMP_ADDR, RESET_PC, TOHOST_ADDR
+from rvasm import EXTIRQ_ADDR, MASK64, MTIMECMP_ADDR, RESET_PC, TOHOST_ADDR
 
 # ===========================================================================
 # Memory model + run harness
@@ -68,6 +68,8 @@ def _mmio_store(state, addr, data):
         state["halt"] = True
     elif addr == MTIMECMP_ADDR:
         state["mtimecmp"] = data & MASK64
+    elif addr == EXTIRQ_ADDR:
+        state["ext"] = data & 1
 
 
 async def _mem_model(dut, mem, state):
@@ -148,8 +150,11 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
     Timer interrupt (ADR 0015): the harness models MTIMECMP at MTIMECMP_ADDR
     (all ones after reset, so no interrupt unless a program writes it) and drives
     irq_timer high, registered like the SoC, while the cycle count >= it. Each
-    dbg_irq pulse is recorded in state["irqs"] as the number of instructions
-    retired before it, so a co-sim can take it in the ISS at the same point.
+    External interrupt (ADR 0017): irq_ext follows bit 0 of the last store to
+    EXTIRQ_ADDR, registered the same way.
+    dbg_irq pulse is recorded in state["irqs"] as (the number of instructions
+    retired before it, the mip levels the core saw), so a co-sim can take the same
+    interrupt in the ISS at the same point.
 
     A fresh clock is started per call: cocotb cleans up scheduled coroutines
     between tests, so a shared clock would stop after the first test.
@@ -157,7 +162,7 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
     clk_task = cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     mem = _load_program(words, data=data)
     state = {"halt": False, "tohost": None, "stop": False, "mlstat_sat": 0, "cycles": 0,
-             "mtimecmp": MASK64, "irqs": []}
+             "mtimecmp": MASK64, "ext": 0, "irqs": []}
     has_irq = hasattr(dut, "irq_timer")
 
     # Assert reset and initialise memory inputs
@@ -166,6 +171,8 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
     dut.dmem_rdata.value = 0
     if has_irq:
         dut.irq_timer.value = 0
+        dut.irq_ext.value = 0
+    levels = (0, 0)                                  # (timer, ext) driven for this edge
     two_slots = hasattr(dut, "dbg1_retire_valid")    # M1-INTERFACE v1.1 second retire slot
     if two_slots:
         dut.imem_rdata1.value = 0
@@ -183,12 +190,15 @@ async def run_program(dut, words, max_cycles=2000, debug=False, data=None):
         await Timer(1, units="ns")
         state["cycles"] = cyc + 1
         if has_irq:
-            # The level for the next edge: the SoC registers cycle >= mtimecmp.
-            dut.irq_timer.value = int(cyc >= state["mtimecmp"])
             if _safe_int(dut.dbg_irq, 0) == 1:     # taken before this cycle's retires
-                state["irqs"].append(len(retires))
+                mip = (levels[0] << 7) | (levels[1] << 11)
+                state["irqs"].append((len(retires), mip))
                 if debug:
                     dut._log.info("interrupt taken after %d retires", len(retires))
+            # The levels for the next edge: the SoC registers cycle >= mtimecmp.
+            levels = (int(cyc >= state["mtimecmp"]), state["ext"])
+            dut.irq_timer.value = levels[0]
+            dut.irq_ext.value = levels[1]
         rv = _safe_int(dut.dbg_retire_valid, 0)
         if rv == 1:
             retires.append({
@@ -250,14 +260,15 @@ def _iss_module():
     return rv64i
 
 
-def _iss_take_irq(iss_mod, iss, name, i):
-    """Take the RTL's interrupt in the ISS. It must have been enabled (mstatus.MIE
-    and mie.MTIE); the ISS then traps exactly as the RTL should."""
-    assert iss.mstatus & iss_mod.MSTATUS_MIE, \
-        f"{name}[{i}]: RTL took an interrupt with mstatus.MIE clear"
-    assert iss.mie & iss_mod.MIE_MTIE, \
-        f"{name}[{i}]: RTL took an interrupt with mie.MTIE clear"
-    iss.take_interrupt()
+def _iss_take_irq(iss, name, i, mip):
+    """Take the RTL's interrupt in the ISS. With the levels the core saw, the ISS
+    must find one enabled (mstatus.MIE and mie); it takes the highest-priority
+    one, so the RTL's mcause is checked by every later read of it."""
+    code = iss.pending_interrupt(mip)
+    assert code is not None, \
+        f"{name}[{i}]: RTL took an interrupt the ISS finds disabled (mip={mip:#x}, " \
+        f"mie={iss.mie:#x}, mstatus={iss.mstatus:#x})"
+    iss.take_interrupt(code)
 
 
 async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check=None):
@@ -283,9 +294,8 @@ async def cosim_lockstep(dut, name, words, data=None, max_cycles=2000, mem_check
 
     irqs = list(state["irqs"])
     for i, rtl_rec in enumerate(retires):
-        while irqs and irqs[0] == i:
-            irqs.pop(0)
-            _iss_take_irq(iss_mod, iss, name, i)
+        while irqs and irqs[0][0] == i:
+            _iss_take_irq(iss, name, i, irqs.pop(0)[1])
         assert not iss.halted, \
             f"{name}[{i}]: RTL retired pc={rtl_rec['pc']:#x} after the tohost store"
         # mcycle/cycle/mip reads are taken from the RTL; the ISS cannot predict

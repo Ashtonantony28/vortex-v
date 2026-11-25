@@ -1,7 +1,9 @@
-"""Machine timer interrupt (ADR 0015), on every core configuration.
+"""Machine timer (ADR 0015) and external (ADR 0017) interrupts, on every core configuration.
 
 The core harness models MTIMECMP at MTIMECMP_ADDR and drives the core's
-irq_timer input high while the cycle count >= it, as the SoC does. Every
+irq_timer input high while the cycle count >= it, as the SoC does; irq_ext
+follows bit 0 of the last store to EXTIRQ_ADDR, standing in for the SoC's
+capture/compare timer. Every
 program runs under lockstep co-sim: each interrupt the RTL takes is taken in
 the ISS at the same point, which must find it enabled (mstatus.MIE and
 mie.MTIE), and every later retire must still match. The tests add explicit
@@ -19,6 +21,9 @@ Programs:
             after it; a store it preempts must not have happened (the handler
             reads that location), and the handler's own multiply must not get
             the preempted divide's result.
+  * ext   - mip.MEIP follows irq_ext; nothing is taken while mie.MEIE is clear;
+            with both interrupts pending the external one goes first
+            (mcause = 2^63 + 11), then the timer; mie keeps only MTIE and MEIE.
 
 Random programs with interrupts every 48-111 cycles: verif/crv
 (test_random_cosim_irq).
@@ -35,7 +40,7 @@ except ImportError:  # pragma: no cover - cocotb is a hard dependency of verif/
     cocotb = None
 
 from cores import CORES, build_and_test
-from rvasm import Asm, DATA_BASE, DATA_SIZE, MASK64, MTIMECMP_ADDR, TOHOST_ADDR
+from rvasm import Asm, DATA_BASE, DATA_SIZE, EXTIRQ_ADDR, MASK64, MTIMECMP_ADDR, TOHOST_ADDR
 
 CSR_MSTATUS, CSR_MIE, CSR_MTVEC = 0x300, 0x304, 0x305
 CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MIP = 0x341, 0x342, 0x343, 0x344
@@ -44,6 +49,9 @@ MSTATUS_MPP_M = 0x1800
 MIE, MPIE = 1 << 3, 1 << 7
 MTIE = MTIP = 1 << 7
 CAUSE_M_TIMER_IRQ = (1 << 63) | 7
+MEIE = MEIP = 1 << 11
+CAUSE_M_EXT_IRQ = (1 << 63) | 11
+R_EXT = 27                      # EXTIRQ_ADDR pointer
 RACE_STEPS = 112
 RACE_EARLY = 4                  # armings already in the past: taken at the next boundary
 
@@ -158,6 +166,74 @@ def race_program():
     return a.assemble()
 
 
+def ext_program():
+    a = Asm()
+    a.la(R_DATA, DATA_BASE)
+    a.la(R_CMP, MTIMECMP_ADDR)
+    a.la(R_EXT, EXTIRQ_ADDR)
+    a.la_label(1, "handler")
+    a.csrw(CSR_MTVEC, 1)
+    a.addi(15, 0, 0)                          # handler log index (bytes)
+    a.addi(1, 0, -1)
+    a.csrw(CSR_MIE, 1)                        # all ones: only MTIE and MEIE stick
+    a.csrr(5, CSR_MIE)
+    a.csrw(CSR_MIE, 0)
+    a.addi(1, 0, 1)
+    a.sd(1, R_EXT, 0)                         # raise irq_ext
+    a.label("poll")
+    a.csrr(6, CSR_MIP)                        # wait for MEIP
+    a.beq(6, 0, "poll")
+    a.csrrsi(0, CSR_MSTATUS, MIE)             # MIE on, MEIE off: nothing taken
+    a.div(7, 1, 1)
+    a.csrr(7, CSR_MCAUSE)                     # 0
+    a.addi(2, 0, MTIE)
+    a.csrw(CSR_MIE, 2)                        # MTIE on, timer not armed: nothing taken
+    a.ld(3, R_DATA, 0)
+    a.csrrci(0, CSR_MSTATUS, MIE)
+    a.sd(0, R_CMP, 0)                         # arm the timer: both pending, MIE off
+    a.label("poll2")
+    a.csrr(8, CSR_MIP)
+    a.srli(9, 8, 7)
+    a.andi(9, 9, 1)
+    a.beq(9, 0, "poll2")
+    a.addi(2, 0, 1)
+    a.slli(2, 2, 11)
+    a.ori(2, 2, MTIE)
+    a.csrw(CSR_MIE, 2)                        # MEIE | MTIE
+    a.csrrsi(0, CSR_MSTATUS, MIE)             # external first, then the timer
+    a.label("after")
+    a.addi(10, 0, 1)
+    a.csrrci(0, CSR_MSTATUS, MIE)
+    for i, r in enumerate((5, 6, 7, 8, 10, 15)):
+        a.sd(r, R_DATA, 8 * (8 + i))
+    a.jal(0, "done")
+    a.label("handler")                        # log mcause and mepc, clear the source, return
+    a.csrr(20, CSR_MCAUSE)
+    a.add(21, R_DATA, 15)
+    a.sd(20, 21, 128)
+    a.csrr(22, CSR_MEPC)
+    a.sd(22, 21, 136)
+    a.addi(15, 15, 16)
+    a.blt(20, 0, "is_irq")
+    a.jal(0, "done")                          # an exception: the log shows it
+    a.label("is_irq")
+    a.andi(20, 20, 0xFF)
+    a.addi(23, 0, 11)
+    a.bne(20, 23, "timer")
+    a.sd(0, R_EXT, 0)                         # drop irq_ext and wait for MEIP to clear
+    a.label("ext_wait")
+    a.csrr(24, CSR_MIP)
+    a.srli(24, 24, 11)
+    a.bne(24, 0, "ext_wait")
+    a.mret()
+    a.label("timer")
+    _disarm(a, 25)
+    a.mret()
+    a.label("done")
+    _end(a)
+    return a.assemble(), a.labels["after"]
+
+
 if cocotb is not None:
     from harness import cosim_lockstep
 
@@ -190,6 +266,21 @@ if cocotb is not None:
         # Early delays always land before the disable; late ones never arrive in time.
         assert 0 < taken < RACE_STEPS, f"{taken} of {RACE_STEPS} armings were taken"
         dut._log.info("race: %d of %d armings taken before the disable", taken, RACE_STEPS)
+
+
+    @cocotb.test()
+    async def ext(dut):
+        words, after = ext_program()
+        state, iss = await _run(dut, "ext", words)
+        assert len(state["irqs"]) == 2, f"{len(state['irqs'])} interrupts taken, expected 2"
+        mie_all, polled, cause0, mip_both, marker, logged = (
+            _mem64(iss, DATA_BASE + 8 * (8 + i)) for i in range(6))
+        assert mie_all == MTIE | MEIE, f"mie reads {mie_all:#x}"
+        assert polled == MEIP and cause0 == 0 and mip_both == MEIP | MTIP and marker == 1
+        assert logged == 32, f"handler ran {logged // 16} times"
+        log = [_mem64(iss, DATA_BASE + 128 + 8 * i) for i in range(4)]
+        # the external interrupt first, at "after"; the timer straight after its mret
+        assert log == [CAUSE_M_EXT_IRQ, after, CAUSE_M_TIMER_IRQ, after], [hex(v) for v in log]
 
 
 @pytest.mark.parametrize("toplevel", CORES)

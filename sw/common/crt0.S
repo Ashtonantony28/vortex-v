@@ -2,8 +2,8 @@
 # main's return value 0 means pass (tohost = 1); anything else fails with that code.
 # Any trap (ecall, ebreak, illegal instruction, ADR 0014; misaligned load, store or
 # jump target, ADR 0016) lands in trap_entry, which
-# lights all four LEDs and fails with code 0x100 + mcause. A timer interrupt
-# (ADR 0015) instead calls irq_handler() and returns.
+# lights all four LEDs and fails with code 0x100 + mcause. An interrupt (timer,
+# ADR 0015; external, ADR 0017) instead calls irq_handler(mcause) and returns.
     .section .text.init
     .globl _start
 _start:
@@ -24,8 +24,8 @@ _start:
 3:  j     3b
 
     .align 2
-# A machine timer interrupt (mcause bit 63; ADR 0015) saves the caller-saved
-# registers, calls irq_handler() and returns with mret. Any other trap fails.
+# An interrupt (mcause bit 63; ADR 0015, 0017) saves the caller-saved registers,
+# calls irq_handler(mcause) and returns with mret. Any other trap fails.
 trap_entry:
     addi  sp, sp, -128
     sd    ra, 0(sp)
@@ -46,6 +46,7 @@ trap_entry:
     sd    t6, 120(sp)
     csrr  t0, mcause
     bgez  t0, trap_fail
+    mv    a0, t0
     call  irq_handler
     ld    ra, 0(sp)
     ld    t0, 8(sp)

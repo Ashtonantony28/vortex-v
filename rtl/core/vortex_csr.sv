@@ -26,6 +26,9 @@
 // core, not decoded here. The core asserts `fault` for one cycle with the cause,
 // mtval and the faulting pc, and fetches from `trap_vector` next.
 //
+// External interrupt (ADR 0017): `irq_ext` is read back as mip.MEIP and enabled
+// by mie.MEIE; when both are pending it is taken before the timer.
+//
 // Reset is asynchronous, like the cores that instantiate it.
 `ifndef VORTEX_CSR_SV
 `define VORTEX_CSR_SV
@@ -54,6 +57,7 @@ module vortex_csr
   output logic            mlstat_sat,
   // Timer interrupt (ADR 0015)
   input  logic            irq_timer,
+  input  logic            irq_ext,
   output logic            irq_pending,
   input  logic            irq_take,
   input  logic [XLEN-1:0] irq_pc,
@@ -71,7 +75,9 @@ module vortex_csr
   logic [XLEN-1:0] mstatus_r, mtvec_r, mscratch_r, mepc_r, mcause_r, mtval_r;
   logic [XLEN-1:0] mcycle_r, minstret_r;
   logic            mlstat_r;
-  logic            mtie_r;
+  logic            mtie_r, meie_r;
+  logic            ext_en;
+  assign ext_en = irq_ext && meie_r;
 
   // ---- Decode the access ----
   logic [11:0]     csr;
@@ -99,8 +105,10 @@ module vortex_csr
       CSR_MCYCLE, CSR_CYCLE       : rdata = mcycle_r;
       CSR_MINSTRET, CSR_INSTRET   : rdata = minstret_r;
       CSR_MLSTAT                  : rdata = XLEN'(mlstat_r);
-      CSR_MIE                     : rdata = XLEN'(mtie_r)    << IRQ_M_TIMER;
-      CSR_MIP                     : rdata = XLEN'(irq_timer) << IRQ_M_TIMER;
+      CSR_MIE                     : rdata = (XLEN'(mtie_r)    << IRQ_M_TIMER)
+                                          | (XLEN'(meie_r)    << IRQ_M_EXT);
+      CSR_MIP                     : rdata = (XLEN'(irq_timer) << IRQ_M_TIMER)
+                                          | (XLEN'(irq_ext)   << IRQ_M_EXT);
       default                     : rdata = '0;   // mlcfg, ID registers
     endcase
   end
@@ -124,7 +132,7 @@ module vortex_csr
   assign target   = trap ? mtvec_r : mepc_r;
   assign no_count = trap || wr_minstret;
 
-  assign irq_pending = irq_timer && mtie_r && mstatus_r[MSTATUS_MIE_BIT];
+  assign irq_pending = ((irq_timer && mtie_r) || ext_en) && mstatus_r[MSTATUS_MIE_BIT];
   assign trap_vector = mtvec_r;
 
   // ---- State ----
@@ -140,6 +148,7 @@ module vortex_csr
       minstret_r <= '0;
       mlstat_r   <= 1'b0;
       mtie_r     <= 1'b0;
+      meie_r     <= 1'b0;
     end else begin
       mcycle_r   <= wr_mcycle   ? wval : (mcycle_r + XLEN'(1));
       minstret_r <= wr_minstret ? wval : (minstret_r + XLEN'(retire_cnt));
@@ -152,7 +161,10 @@ module vortex_csr
           CSR_MEPC    : mepc_r     <= wval & ALIGN_MASK;
           CSR_MCAUSE  : mcause_r   <= wval;
           CSR_MTVAL   : mtval_r    <= wval;
-          CSR_MIE     : mtie_r     <= wval[IRQ_M_TIMER];
+          CSR_MIE     : begin
+            mtie_r <= wval[IRQ_M_TIMER];
+            meie_r <= wval[IRQ_M_EXT];
+          end
           default     : ;                     // misa, mip, mlcfg, counters, mlstat
         endcase
       end
@@ -182,7 +194,7 @@ module vortex_csr
       // The core never takes an interrupt in a cycle where an instruction executes.
       if (irq_take) begin
         mepc_r    <= irq_pc & ALIGN_MASK;
-        mcause_r  <= XLEN'(CAUSE_M_TIMER_IRQ);
+        mcause_r  <= ext_en ? XLEN'(CAUSE_M_EXT_IRQ) : XLEN'(CAUSE_M_TIMER_IRQ);
         mtval_r   <= '0;
         mstatus_r <= XLEN'(MSTATUS_MPP_M)
                    | (XLEN'(mstatus_r[MSTATUS_MIE_BIT]) << MSTATUS_MPIE_BIT);

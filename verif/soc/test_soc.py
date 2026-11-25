@@ -6,6 +6,11 @@ a greeting, a device-ordering check, an int8 dot product computed on the Xmlacc 
 program against plain C, and the cycle counter. It also checks the LEDs and the
 tohost pass flag.
 
+sw/capcmp runs on SoCs built with the capture/compare timer (CAPCMP=1, ADR 0017):
+the bench drives crank and cam edges, the firmware captures them under the
+external interrupt and schedules injector and coil outputs in hardware, and the
+bench checks each capture's tick and each output edge to the exact timer tick.
+
 Run (from the repo root):  python3 -m pytest verif/soc -q
 Needs riscv64-unknown-elf-gcc (scripts/setup-toolchain.sh); skipped without it
 unless CI is set.
@@ -43,7 +48,117 @@ try:
 except ImportError:  # pragma: no cover
     cocotb = None
 
+# CAPCMP=1 builds for sw/capcmp; a short prescaler keeps the simulation short
+CC_PRESC = 4
+CAPCMP_CONFIGS = {
+    "soc_inorder_cc": {"CORE_OOO": 0, "CAPCMP": 1, "CAP_PRESC": CC_PRESC},
+    "soc_ooo_cc": {"CORE_OOO": 1, "CAPCMP": 1, "CAP_PRESC": CC_PRESC},
+    "soc_ooo_sync_cc": dict(SOC_CONFIGS["soc_ooo_sync"], CAPCMP=1, CAP_PRESC=CC_PRESC),
+}
+# Must match sw/capcmp/capcmp.c
+DWELL_AT, INJ_AT, INJ_LEN, SPARK_AT, LATE_OUT, LATE_LEN = 120, 150, 40, 200, 3, 10
+CC_EDGES = [0, 0, 1, 0, 0]          # capture channel of each edge: crank, crank, cam, crank, crank
+CC_EDGE_GAP = 2000                  # cycles between edges (> SPARK_AT ticks)
+CC_MAX_CYCLES = 60_000
+
 if cocotb is not None:
+    async def _uart_rx(dut, text):
+        """Decode the UART line (8N1, CLKS_PER_BIT) into text, forever."""
+        while True:
+            await FallingEdge(dut.clk)
+            if int(dut.uart_tx.value) != 0:
+                continue
+            byte = 0
+            for _ in range(CLKS_PER_BIT // 2):           # to the middle of the start bit
+                await FallingEdge(dut.clk)
+            for bit in range(9):
+                for _ in range(CLKS_PER_BIT):
+                    await FallingEdge(dut.clk)
+                if bit < 8:
+                    byte |= int(dut.uart_tx.value) << bit
+                else:
+                    assert int(dut.uart_tx.value) == 1, "UART framing error"
+            text.append(byte)
+
+    @cocotb.test()
+    async def soc_capcmp(dut):
+        """Crank/cam captures under the external interrupt; outputs on the exact tick."""
+        cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+        dut.cap_in.value = 0
+        dut.rst_n.value = 0
+        for _ in range(3):
+            await RisingEdge(dut.clk)
+        await FallingEdge(dut.clk)
+        dut.rst_n.value = 1
+        cc = dut.g_capcmp.u_capcmp
+        text = bytearray()
+        cocotb.start_soon(_uart_rx(dut, text))
+
+        cyc = 0
+        changes = []                                     # (output, level, tick)
+        pushes = []                                      # tick of each CMP_PUSH write
+        last_out = 0
+
+        async def clock():
+            nonlocal cyc, last_out
+            if int(cc.wr_push.value):
+                pushes.append(int(cc.time_q.value))
+            await FallingEdge(dut.clk)
+            cyc += 1
+            out = int(dut.cmp_out.value)
+            for o in range(8):
+                if (out ^ last_out) >> o & 1:
+                    changes.append((o, out >> o & 1, int(cc.time_q.value)))
+            last_out = out
+
+        while int(dut.leds.value) != 1:
+            assert cyc < CC_MAX_CYCLES, f"firmware never got ready; UART {text.decode()!r}"
+            await clock()
+        late = changes[:]
+        changes.clear()
+
+        cap = 0
+        driven = []                                      # (channel, expected tick)
+        for ch in CC_EDGES:
+            cap |= 1 << ch
+            dut.cap_in.value = cap
+            await clock()
+            await clock()                                # two synchroniser flops
+            driven.append((ch, int(cc.time_q.value)))    # the tick latched at the next edge
+            for _ in range(50):
+                await clock()
+            cap &= ~(1 << ch)
+            dut.cap_in.value = cap
+            for _ in range(CC_EDGE_GAP - 52):
+                await clock()
+        while int(dut.done.value) == 0:
+            assert cyc < CC_MAX_CYCLES, f"no tohost store; UART {text.decode()!r}"
+            await clock()
+        for _ in range(12 * CLKS_PER_BIT):               # the last UART frame
+            await clock()
+
+        out = text.decode("ascii", errors="replace")
+        dut._log.info("UART output:\n%s", out)
+        lines = out.splitlines()
+        assert int(getattr(dut, "pass").value) == 1, f"program reported failure; UART: {out!r}"
+        assert lines[0] == "capcmp" and lines[-1] == " capcmp ok", lines
+        t0 = int(lines[1].split()[1], 16)
+        caps = [int(line.split()[1], 16) for line in lines[2:-1]]
+        assert caps == [(1 << 63) | ((ch + 1) << 32) | ts for ch, ts in driven], \
+            ([hex(c) for c in caps], driven)
+        # The late pulse: armed 5 ticks in the past, it fires in the clock after the push
+        # (the output then rises within a tick of the push) and lasts its full length
+        (o0, l0, r), (o1, l1, f) = late
+        assert (o0, l0, o1, l1) == (LATE_OUT, 1, LATE_OUT, 0) and f - r == LATE_LEN, late
+        assert t0 <= pushes[0] and r - pushes[0] in (0, 1), (t0, pushes[0], late)
+        expect = []
+        for i, ts in enumerate(ts for ch, ts in driven if ch == 0):
+            inj, coil = i % 4, 4 + i % 4
+            expect += [(coil, 1, ts + DWELL_AT), (inj, 1, ts + INJ_AT),
+                       (inj, 0, ts + INJ_AT + INJ_LEN), (coil, 0, ts + SPARK_AT)]
+        assert sorted(changes, key=lambda c: (c[2], c[0])) == sorted(expect, key=lambda c: (c[2], c[0])), \
+            (changes, expect)
+
     @cocotb.test()
     async def soc_hello(dut):
         """Reset, run until tohost, decode the UART text."""
@@ -106,8 +221,7 @@ def _require_gcc():
         pytest.skip("riscv64-unknown-elf-gcc not installed")
 
 
-@pytest.mark.parametrize("config", list(SOC_CONFIGS))
-def test_soc_runs_hello(config):
+def _run_program(program, config, params, testcase):
     _require_gcc()
     from build import build
     from cores import rtl_sources
@@ -117,14 +231,24 @@ def test_soc_runs_hello(config):
         from cocotb.runner import get_runner
 
     build_dir = HERE / "sim_build" / config
-    hexf = build("hello", build_dir / "sw")
+    hexf = build(program, build_dir / "sw")
     soc_srcs = [str(ROOT / line.strip()) for line in (ROOT / "rtl/soc/files.f").read_text()
                 .splitlines() if line.strip() and not line.strip().startswith("//")]
-    params = dict(SOC_CONFIGS[config], CLKS_PER_BIT=CLKS_PER_BIT, INIT_FILE=f'"{hexf}"')
+    params = dict(params, CLKS_PER_BIT=CLKS_PER_BIT, INIT_FILE=f'"{hexf}"')
     os.environ["PYTHONPATH"] = os.pathsep.join([str(HERE), os.environ.get("PYTHONPATH", "")])
     runner = get_runner(os.getenv("SIM", "icarus"))
     runner.build(sources=rtl_sources() + soc_srcs, hdl_toplevel="vortex_soc",
                  build_dir=str(build_dir), parameters=params, always=True,
                  timescale=("1ns", "1ps"))
     runner.test(hdl_toplevel="vortex_soc", test_module="test_soc", test_dir=str(HERE),
-                build_dir=str(build_dir), timescale=("1ns", "1ps"))
+                build_dir=str(build_dir), timescale=("1ns", "1ps"), testcase=testcase)
+
+
+@pytest.mark.parametrize("config", list(SOC_CONFIGS))
+def test_soc_runs_hello(config):
+    _run_program("hello", config, SOC_CONFIGS[config], "soc_hello")
+
+
+@pytest.mark.parametrize("config", list(CAPCMP_CONFIGS))
+def test_soc_capcmp_schedules_outputs(config):
+    _run_program("capcmp", config, CAPCMP_CONFIGS[config], "soc_capcmp")

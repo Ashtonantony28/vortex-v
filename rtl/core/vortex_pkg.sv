@@ -181,6 +181,9 @@ package vortex_pkg;
   // Machine timer interrupt (ADR 0015): mcause bit 63 set, code 7; mie.MTIE/mip.MTIP bit 7.
   localparam int unsigned IRQ_M_TIMER      = 7;
   localparam logic [63:0] CAUSE_M_TIMER_IRQ = (64'd1 << 63) | 64'd7;
+  // Machine external interrupt (ADR 0017), from the SoC's capture/compare unit
+  localparam int unsigned IRQ_M_EXT        = 11;
+  localparam logic [63:0] CAUSE_M_EXT_IRQ  = (64'd1 << 63) | 64'd11;
 
   // mstatus fields: MIE, MPIE writable; MPP reads M (no other privilege modes).
   localparam int unsigned MSTATUS_MIE_BIT  = 3;

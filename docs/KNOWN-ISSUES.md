@@ -90,8 +90,9 @@ correctness failures — the full suite is green — but they're real and owned.
   `SPEC_BRANCHES=1` a device load at the memory-queue head can still be on a wrong path.
 
 ## Zicsr and traps (ADR 0014)
-- **I21:** machine mode only, and the only interrupt is the machine timer (ADR 0015): no
-  software or external interrupts, and `wfi` is a no-op. Misaligned loads and stores trap
+- **I21:** machine mode only, and the only interrupts are the machine timer (ADR 0015) and one
+  machine external interrupt line (ADR 0017): no software interrupts, no PLIC, and `wfi` is a
+  no-op. Misaligned loads and stores trap
   instead of working (ADR 0016), so riscv-tests `ma_data` (which expects them to work) stays
   excluded.
 - **I22 (verification gap):** `mcycle`/`cycle` reads are not checked against the ISS; the co-sim
@@ -117,3 +118,10 @@ correctness failures — the full suite is green — but they're real and owned.
 - **I27 (performance, by design):** a misaligned load, store or jump waits until it is the
   oldest instruction and then flushes the whole out-of-order pipeline.
 
+## Capture/compare timer (ADR 0017)
+- **I28 (by design):** each capture channel holds one edge until it enters the FIFO (one per
+  clock, lowest channel first), so a second edge on a channel in the next clock or two is
+  dropped and counted in CAP_OVF. Engine inputs are thousands of clocks apart.
+- **I29 (verification gap):** the external interrupt's random arrival is not in the `verif/crv`
+  co-sim; it shares the take path with the timer interrupt, which is. The SoC test and the
+  directed core test exercise it. The Arty top has no pins for the unit yet (`cap_in` tied to 0).

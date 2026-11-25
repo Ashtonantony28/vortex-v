@@ -47,6 +47,11 @@ harness serves and reads the extra ports only when the toplevel has them.
 - out `dbg_irq`: a one-cycle pulse, in the same cycle as the retire outputs, when an interrupt
   was taken. No instruction retires in that cycle; the instruction at `mepc` retires later.
 
+## v1.3 additive port (ADR 0017, external interrupt; both cores)
+- in `irq_ext`: the machine external interrupt level (`mip.MEIP`), from the SoC's
+  capture/compare timer. Drive it 0 when unused; the harness drives it from bit 0 of the last
+  store to `0x8000_1010`. Taken before the timer interrupt when both are pending.
+
 ## Golden model contract (`model/iss/rv64i.py`)
 A pure-Python RV64I instruction-set simulator:
 - `step()` executes one instruction, returns a record `{pc, inst, rd, rd_val, mem}`.

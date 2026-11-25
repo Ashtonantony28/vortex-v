@@ -77,6 +77,11 @@ CAUSE_MISALIGNED_FETCH, CAUSE_MISALIGNED_LOAD, CAUSE_MISALIGNED_STORE = 0, 4, 6
 IRQ_M_TIMER = 7
 CAUSE_INTERRUPT = 1 << 63
 MIE_MTIE = 1 << IRQ_M_TIMER
+# Machine external interrupt (ADR 0017): the SoC's capture/compare unit. It has
+# priority over the timer interrupt.
+IRQ_M_EXT = 11
+MIE_MEIE = 1 << IRQ_M_EXT
+MIE_MASK = MIE_MTIE | MIE_MEIE
 INST_ECALL, INST_EBREAK, INST_MRET, INST_WFI = 0x00000073, 0x00100073, 0x30200073, 0x10500073
 
 
@@ -405,6 +410,16 @@ class Hart:
         if self.traps and (addr & (size - 1)):
             raise Misaligned(cause, addr)
 
+    def pending_interrupt(self, mip: int) -> int | None:
+        """The interrupt the hart takes with these mip levels, or None: enabled by
+        mstatus.MIE and mie, external (11) before timer (7)."""
+        if not (self.mstatus & MSTATUS_MIE):
+            return None
+        for code in (IRQ_M_EXT, IRQ_M_TIMER):
+            if mip & self.mie & (1 << code):
+                return code
+        return None
+
     def take_interrupt(self, code: int = IRQ_M_TIMER) -> dict:
         """Take an interrupt before the instruction at pc (ADR 0015). The co-sim calls
         this when the RTL reports one; the ISS does not model when interrupts arrive."""
@@ -446,7 +461,7 @@ class Hart:
         if csr in (CSR_MCYCLE, CSR_CYCLE):
             return self.mcycle if self.read_override is None else u64(self.read_override)
         if csr == CSR_MIP:
-            return 0 if self.read_override is None else u64(self.read_override) & MIE_MTIE
+            return 0 if self.read_override is None else u64(self.read_override) & MIE_MASK
         if csr == CSR_MIE:
             return self.mie
         if csr in (CSR_MINSTRET, CSR_INSTRET):
@@ -480,7 +495,7 @@ class Hart:
             self.minstret = new
             return True
         elif csr == CSR_MIE:
-            self.mie = new & MIE_MTIE
+            self.mie = new & MIE_MASK
         return False                       # misa, mip, mlcfg: writes ignored
 
     def _exec(self, pc: int, inst: int) -> dict:

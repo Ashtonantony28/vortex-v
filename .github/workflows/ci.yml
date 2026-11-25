@@ -7,7 +7,8 @@ name: CI
 #   2. lint   - verilator --lint-only -Wall over rtl/core/files.f, for both
 #               tops (vortex_core, and vortex_ooo_core at WIDTH 1 and 2, and
 #               two-wide with SPEC_BRANCHES=1, plus LSQ=1, plus XM_LATENCY=3), the
-#               SoC (vortex_soc) and the Arty A7 top (arty_a7_top).
+#               SoC (vortex_soc, also with the capture/compare timer, and that
+#               unit alone at small sizes) and the Arty A7 top (arty_a7_top).
 #   The tests job also runs the yosys SAT proof of the LSQ forwarding unit
 #   (verif/formal, ADR 0009).
 
@@ -72,4 +73,8 @@ jobs:
           verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GXM_PORTS=2 -f rtl/core/files.f
           verilator --lint-only -Wall --top-module vortex_ooo_core -GWIDTH=2 -GSPEC_BRANCHES=1 -GLSQ=1 -GXM_LATENCY=3 -GSYNC_MEM=1 -GXM_PORTS=2 -f rtl/core/files.f
           verilator --lint-only -Wall --top-module vortex_soc -GSYNC_MEM=1 -f rtl/core/files.f -f rtl/soc/files.f
+          verilator --lint-only -Wall --top-module vortex_soc -GCAPCMP=1 -f rtl/core/files.f -f rtl/soc/files.f
+          verilator --lint-only -Wall --top-module vortex_soc -GCAPCMP=1 -GCORE_OOO=0 -f rtl/core/files.f -f rtl/soc/files.f
+          verilator --lint-only -Wall --top-module vortex_capcmp -GTW=12 -GN_CAP=3 -GCAP_DEPTH=4 -GN_OUT=5 -GN_CMP=3 rtl/soc/vortex_capcmp.sv
+          verilator --lint-only -Wall --top-module vortex_capcmp -GTW=8 -GN_CAP=1 -GCAP_DEPTH=2 -GN_OUT=1 -GN_CMP=1 rtl/soc/vortex_capcmp.sv
           verilator --lint-only -Wall --top-module arty_a7_top -f rtl/core/files.f -f rtl/soc/files.f -f rtl/fpga/files.f
