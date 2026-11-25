@@ -26,6 +26,15 @@ A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML exten
 > bitstream (Vivado not yet run), and benchmarks.
 > Every claim here is backed by a `Verify` command in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+![Instructions retired vs clock cycle for four core configurations (RTL simulation)](docs/media/retire-race.gif)
+
+<sub>**RTL simulation**, cocotb + Icarus, of the `verif/core/test_ooo.py` microbenchmarks on four configurations of
+the same RTL. These are cycle counts, not FPGA measurements (no bitstream yet). Out-of-order execution hides the
+65-cycle divide, 2-wide retires two per cycle, and speculation is what makes branchy code faster: without it the
+1-wide OoO core is *slower* than the in-order core on the loop (428 vs 346 cycles), because every branch waits
+to resolve. Regenerate: `python3 scripts/media/retire_race.py` ([MP4](docs/media/retire-race.mp4),
+[still](docs/media/retire-race.png)).</sub>
+
 ## What this is
 
 Vortex-V is a from-scratch application-class RISC-V core designed to be a serious study of
