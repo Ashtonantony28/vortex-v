@@ -125,3 +125,8 @@ correctness failures — the full suite is green — but they're real and owned.
 - **I29 (verification gap):** the external interrupt's random arrival is not in the `verif/crv`
   co-sim; it shares the take path with the timer interrupt, which is. The SoC test and the
   directed core test exercise it. The Arty top has no pins for the unit yet (`cap_in` tied to 0).
+- **I30 (by design):** timing offsets of the capture/compare timer: an output changes one clock
+  after TIME reaches its tick (registered output), and a capture is stamped with TIME two clocks
+  after the pin edge (synchroniser). Both are one 20 ns clock or two against a 1 µs tick.
+- **I31 (missing feature):** pending compares can only be cancelled all at once (CMP_FLUSH); there
+  is no per-slot or per-output cancel, and TIME cannot be written.

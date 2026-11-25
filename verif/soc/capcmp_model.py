@@ -90,7 +90,7 @@ class CapCmp:
         push_ch = next((c for c in range(self.n_cap) if self.held[c]), None)
         full = self.count() == self.depth
         fire = [s is not None and self._reached(t, s[0]) for s in self.slots]
-        free = next((k for k, s in enumerate(self.slots) if s is None), None)
+        free = next((k for k, s in enumerate(self.slots) if s is None or fire[k]), None)
         f_clear, f_pulse, f_set = set(), {}, set()
         for k, s in enumerate(self.slots):
             if fire[k]:
