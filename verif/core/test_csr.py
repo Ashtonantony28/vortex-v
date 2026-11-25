@@ -79,7 +79,7 @@ def csr_rw_program():
     a.csrw(CSR_MTVAL, 1); a.csrr(11, CSR_MTVAL)       # ~0
     a.csrw(CSR_MSTATUS, 1); a.csrr(12, CSR_MSTATUS)   # MPP | MPIE | MIE
     a.csrw(CSR_MISA, 0); a.csrr(13, CSR_MISA)         # write ignored
-    a.csrw(CSR_MIE, 1); a.csrr(14, CSR_MIE)           # MTIE only (ADR 0015)
+    a.csrw(CSR_MIE, 1); a.csrr(14, CSR_MIE)           # MTIE and MEIE only (ADR 0015, 0017)
     a.csrw(CSR_MIP, 1); a.csrr(15, CSR_MIP)           # 0
     a.csrr(16, CSR_MHARTID)
     a.csrr(17, CSR_MVENDORID)
@@ -234,7 +234,7 @@ if cocotb is not None:
         ones = MASK64
         expect = {2: 0, 3: ones, 4: ones, 5: 0, 6: 21, 7: 16, 8: ones & ~3, 9: ones & ~3,
                   10: ones, 11: ones, 12: MSTATUS_MPP_M | MPIE | MIE, 13: MISA_VALUE,
-                  14: 1 << 7, 15: 0, 16: 0, 17: 0, 18: 0, 19: 0, 20: 0, 24: 100, 25: 101}
+                  14: (1 << 7) | (1 << 11), 15: 0, 16: 0, 17: 0, 18: 0, 19: 0, 20: 0, 24: 100, 25: 101}
         for r, v in expect.items():
             assert regs[r] == v, f"x{r} = {regs[r]:#x}, expected {v:#x}"
         assert regs[22] - regs[21] == 3, f"instret advanced {regs[22] - regs[21]}, expected 3"

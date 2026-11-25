@@ -1,7 +1,8 @@
 // vortex_soc.sv — simulation-ready SoC around a Vortex-V core (ADR 0011).
 //
 // One core (the in-order vortex_core or vortex_ooo_core), one unified RAM, and a
-// small MMIO block: a UART transmitter, four LEDs and a cycle counter.
+// small MMIO block: a UART transmitter, four LEDs, a cycle counter and, with
+// CAPCMP=1, the capture/compare timer (ADR 0017).
 //
 // Address map
 //   RAM_BASE .. +RAM_BYTES   code, data and stack (default 0x8000_0000, 16 KiB)
@@ -12,6 +13,9 @@
 //   MMIO_BASE + 0x18  R      CYCLE: cycles since reset (also mtime)
 //   MMIO_BASE + 0x20  RW     MTIMECMP: machine timer interrupt while CYCLE >= MTIMECMP
 //                            (resets to all ones; ADR 0015)
+//   MMIO_BASE + 0x80..0xFF   capture/compare timer registers (CAPCMP=1; rtl/soc/vortex_capcmp.sv,
+//                            ADR 0017), 64-bit accesses only. Its capture interrupt is the
+//                            core's machine external interrupt.
 // Other addresses read 0 and ignore writes.
 //
 // MMIO reads have no side effects, so speculative loads may read them safely
@@ -34,23 +38,31 @@ module vortex_soc
   parameter logic [XLEN-1:0]  TOHOST_ADDR   = 64'h8000_1000,
   parameter logic [XLEN-1:0]  MMIO_BASE     = 64'h1000_0000,
   parameter int unsigned      CLKS_PER_BIT  = 868,    // UART: 100 MHz / 115200 baud
-  parameter                   INIT_FILE     = ""      // RAM image (hex, 64-bit words)
+  parameter                   INIT_FILE     = "",     // RAM image (hex, 64-bit words)
+  parameter int unsigned      CAPCMP        = 0,      // capture/compare timer (ADR 0017)
+  parameter int unsigned      CAP_PRESC     = 49,     // its reset prescaler: 50 MHz -> 1 MHz ticks
+  parameter int unsigned      N_CAP         = 2,      // capture inputs (crank, cam)
+  parameter int unsigned      N_OUT         = 8       // compare outputs (4 injectors, 4 coils)
 ) (
   input  logic       clk,
   input  logic       rst_n,
   output logic       uart_tx,
   output logic [3:0] leds,
+  input  logic [N_CAP-1:0] cap_in,   // capture pins (asynchronous; synchronised inside)
+  output logic [N_OUT-1:0] cmp_out,  // compare outputs (0 when CAPCMP=0)
   output logic       done,       // the program stored to tohost
   output logic       pass        // ... and the value was 1
 );
   localparam int unsigned RAMW       = $clog2(RAM_BYTES);
-  localparam int unsigned MMIO_SPAN  = 64;
+  localparam int unsigned MMIO_SPAN  = 256;
   localparam int unsigned MMW        = $clog2(MMIO_SPAN);
   localparam logic [MMW-1:0] REG_UART_TX     = MMW'(6'h00);
   localparam logic [MMW-1:0] REG_UART_STATUS = MMW'(6'h08);
   localparam logic [MMW-1:0] REG_LEDS        = MMW'(6'h10);
   localparam logic [MMW-1:0] REG_CYCLE       = MMW'(6'h18);   // also mtime (ADR 0015)
   localparam logic [MMW-1:0] REG_MTIMECMP    = MMW'(6'h20);   // timer IRQ when CYCLE >= this
+  localparam int unsigned     CC_AW           = 7;             // capture/compare block: 128 bytes
+  localparam logic [MMW-1:0] CC_BASE          = MMW'(8'h80);
   localparam logic [XLEN-1:0] TOHOST_PASS    = XLEN'(1);
 
   initial begin
@@ -66,6 +78,7 @@ module vortex_soc
   logic            dmem_req, dmem_we;
   logic [XLEN-1:0] dmem_addr, dmem_wdata, dmem_rdata;
   logic            timer_irq;   // registered CYCLE >= MTIMECMP (ADR 0015)
+  logic            ext_irq;     // capture FIFO not empty, when enabled (ADR 0017)
   logic [XLEN-1:0] mtimecmp;
   logic [1:0]      dmem_size;
 
@@ -96,6 +109,7 @@ module vortex_soc
       .dmem_wdata        (dmem_wdata),
       .dmem_rdata        (dmem_rdata),
       .irq_timer         (timer_irq),
+      .irq_ext           (ext_irq),
       .dbg_irq           (),
       .dbg_retire_valid  (),
       .dbg_retire_pc     (),
@@ -126,6 +140,7 @@ module vortex_soc
       .dmem_wdata       (dmem_wdata),
       .dmem_rdata       (dmem_rdata),
       .irq_timer        (timer_irq),
+      .irq_ext          (ext_irq),
       .dbg_irq          (),
       .dbg_retire_valid (),
       .dbg_retire_pc    (),
@@ -185,15 +200,50 @@ module vortex_soc
     .tx    (uart_tx)
   );
 
+  // Capture/compare timer (ADR 0017)
+  logic            sel_cc;
+  logic [XLEN-1:0] cc_rdata;
+  assign sel_cc = (reg_off[MMW-1:CC_AW] == CC_BASE[MMW-1:CC_AW]);
+  if (CAPCMP != 0) begin : g_capcmp
+    vortex_capcmp #(
+      .XLEN      (XLEN),
+      .N_CAP     (N_CAP),
+      .N_OUT     (N_OUT),
+      .PRESC_RST (CAP_PRESC)
+    ) u_capcmp (
+      .clk     (clk),
+      .rst_n   (rst_n),
+      .we      (dmem_req && dmem_we && sel_mmio && sel_cc),
+      .addr    (reg_off[CC_AW-1:0]),
+      .wdata   (dmem_wdata),
+      .rdata   (cc_rdata),
+      .cap_in  (cap_in),
+      .cmp_out (cmp_out),
+      .irq     (ext_irq)
+    );
+  end else begin : g_no_capcmp
+    assign cc_rdata = '0;
+    assign cmp_out  = '0;
+    assign ext_irq  = 1'b0;
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic unused_cap;
+    assign unused_cap = ^cap_in;
+    /* verilator lint_on UNUSEDSIGNAL */
+  end
+
   logic [XLEN-1:0] mmio_rdata;
   always_comb begin
-    unique case (reg_off)
-      REG_UART_STATUS: mmio_rdata = XLEN'(tx_busy);
-      REG_LEDS:        mmio_rdata = XLEN'(led_q);
-      REG_CYCLE:       mmio_rdata = cycle;
-      REG_MTIMECMP:    mmio_rdata = mtimecmp;
-      default:         mmio_rdata = '0;
-    endcase
+    if (sel_cc) begin
+      mmio_rdata = cc_rdata;
+    end else begin
+      unique case (reg_off)
+        REG_UART_STATUS: mmio_rdata = XLEN'(tx_busy);
+        REG_LEDS:        mmio_rdata = XLEN'(led_q);
+        REG_CYCLE:       mmio_rdata = cycle;
+        REG_MTIMECMP:    mmio_rdata = mtimecmp;
+        default:         mmio_rdata = '0;
+      endcase
+    end
   end
   // With SYNC_MEM the RAM answers a cycle late, so the MMIO data and the
   // select are registered to line up with it.

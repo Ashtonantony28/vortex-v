@@ -48,7 +48,8 @@ static int csr_ok(void) {
 #define TICKS 3
 static volatile int ticks;
 
-void irq_handler(void) {
+void irq_handler(uint64_t mcause) {
+    (void)mcause;                  // only the timer is enabled here
     if (++ticks < TICKS) timer_arm(300);
     else timer_disarm();
 }

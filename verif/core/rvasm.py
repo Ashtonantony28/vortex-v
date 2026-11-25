@@ -11,6 +11,8 @@ TOHOST_ADDR = 0x8000_1000
 # The core harness models a timer compare register here (ADR 0015): the core's
 # irq_timer input is high while the cycle count >= the last value stored to it.
 MTIMECMP_ADDR = 0x8000_1008
+# ... and an external interrupt line (ADR 0017): irq_ext follows bit 0 of the last store here.
+EXTIRQ_ADDR = 0x8000_1010
 DATA_BASE   = 0x8000_2000
 DATA_SIZE   = 0x1000        # data region [DATA_BASE, DATA_BASE+DATA_SIZE)
 CODE_LIMIT  = TOHOST_ADDR   # programs at RESET_PC must end below tohost

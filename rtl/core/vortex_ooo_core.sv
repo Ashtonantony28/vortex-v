@@ -78,6 +78,8 @@ module vortex_ooo_core
 
   // Machine timer interrupt level from the SoC (mtime >= mtimecmp; ADR 0015)
   input  logic              irq_timer,
+  // Machine external interrupt level from the SoC (ADR 0017)
+  input  logic              irq_ext,
 
   // Debug / retire introspection (driven at commit)
   output logic              dbg_retire_valid,
@@ -629,6 +631,7 @@ module vortex_ooo_core
     .sat_set    (sat_set),
     .mlstat_sat (dbg_mlstat_sat),
     .irq_timer  (irq_timer),
+    .irq_ext    (irq_ext),
     .irq_pending(irq_pending),
     .irq_take   (take_irq),
     .irq_pc     (pc),

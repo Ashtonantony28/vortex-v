@@ -16,11 +16,13 @@ A 2-wide out-of-order superscalar **RV64GC** core with a custom integer-ML exten
 > and runs gcc-built C programs from `sw/` (ADR 0011); `SYNC_MEM=1` lets the core use block RAM
 > (ADR 0012). Both cores implement Zicsr with the machine-mode CSRs (`mcycle`, `minstret`,
 > `mtvec`, `mepc`, `mcause`, Xmlacc's `mlstat`, ...) and ecall/ebreak/illegal-instruction traps
-> (ADR 0014), misaligned-access traps (ADR 0016) and the machine timer interrupt (ADR 0015). All eight core configurations run
+> (ADR 0014), misaligned-access traps (ADR 0016), the machine timer interrupt (ADR 0015) and the
+> machine external interrupt, raised by an optional capture/compare timer in the SoC for engine
+> control (`CAPCMP=1`, ADR 0017). All eight core configurations run
 > under Icarus via cocotb and are checked
 > instruction-by-instruction against a Python ISS golden model (`model/iss/`), on directed tests,
 > the riscv-tests rv64ui + rv64um suites (65 tests), and seeded constrained-random programs. Not
-> built yet: the L1 data cache, the C extension, software/external interrupts, `riscv-arch-test`, Spike, the FPGA
+> built yet: the L1 data cache, the C extension, software interrupts and a PLIC, `riscv-arch-test`, Spike, the FPGA
 > bitstream (Vivado not yet run), and benchmarks.
 > Every claim here is backed by a `Verify` command in [docs/ROADMAP.md](docs/ROADMAP.md).
 

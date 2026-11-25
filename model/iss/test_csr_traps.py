@@ -33,11 +33,11 @@ def test_field_masks_and_ignored_csrs():
               csr(1, 0, 0x305, 1), csr(2, 3, 0x305, 0),     # mtvec
               csr(1, 0, 0x341, 1), csr(2, 4, 0x341, 0),     # mepc
               csr(1, 0, 0x301, 0), csr(2, 5, 0x301, 0),     # misa: write ignored
-              csr(1, 0, 0x304, 1), csr(2, 6, 0x304, 0)])    # mie: MTIE only
+              csr(1, 0, 0x304, 1), csr(2, 6, 0x304, 0)])    # mie: MTIE and MEIE only
     run(h, 11)
     assert h.x[2] == MSTATUS_MPP_M | MSTATUS_MPIE | MSTATUS_MIE
     assert h.x[3] == h.x[4] == (1 << 64) - 4
-    assert h.x[5] == MISA_VALUE and h.x[6] == 1 << 7   # mie: only MTIE (ADR 0015)
+    assert h.x[5] == MISA_VALUE and h.x[6] == (1 << 7) | (1 << 11)   # mie (ADR 0015, 0017)
 
 
 def test_minstret_counts_retired_and_write_is_not_counted():
@@ -106,12 +106,12 @@ def test_mcycle_read_uses_the_cosim_override():
 
 
 def test_timer_interrupt_and_mie():
-    from rv64i import CAUSE_INTERRUPT, MIE_MTIE
+    from rv64i import CAUSE_INTERRUPT, MIE_MEIE, MIE_MTIE
     h = hart([addi(1, 0, -1), csr(1, 0, 0x304, 1), csr(2, 2, 0x304, 0), addi(3, 0, 3)])
     h.mtvec = RESET_PC + 0x100
     h.mstatus |= MSTATUS_MIE
     run(h, 3)
-    assert h.x[2] == MIE_MTIE                 # only MTIE is writable
+    assert h.x[2] == MIE_MTIE | MIE_MEIE      # only MTIE and MEIE are writable
     rec = h.take_interrupt()
     assert rec["irq"] == CAUSE_INTERRUPT | 7 and rec["pc"] == RESET_PC + 12
     assert h.mepc == RESET_PC + 12 and h.mcause == CAUSE_INTERRUPT | 7 and h.mtval == 0
@@ -122,7 +122,25 @@ def test_mip_read_uses_the_cosim_override():
     h = hart([csr(2, 1, 0x344, 0)])
     h.read_override = 0xFFFF
     h.step()
-    assert h.x[1] == 1 << 7
+    assert h.x[1] == (1 << 7) | (1 << 11)
+
+
+def test_pending_interrupt_priority_and_masks():
+    """ADR 0017: external before timer; each needs its mie bit and mstatus.MIE."""
+    from rv64i import IRQ_M_EXT, IRQ_M_TIMER, MIE_MEIE, MIE_MTIE
+    h = hart([addi(1, 0, 0)])
+    both = MIE_MTIE | MIE_MEIE              # mip uses the same bit positions
+    h.mie = both
+    assert h.pending_interrupt(both) is None          # mstatus.MIE clear
+    h.mstatus |= MSTATUS_MIE
+    assert h.pending_interrupt(both) == IRQ_M_EXT
+    assert h.pending_interrupt(MIE_MTIE) == IRQ_M_TIMER
+    assert h.pending_interrupt(0) is None
+    h.mie = MIE_MTIE
+    assert h.pending_interrupt(MIE_MEIE) is None
+    assert h.pending_interrupt(both) == IRQ_M_TIMER
+    rec = h.take_interrupt(IRQ_M_EXT)
+    assert h.mcause == (1 << 63) | 11 and rec["irq"] == h.mcause
 
 
 def _jal(rd, off):
