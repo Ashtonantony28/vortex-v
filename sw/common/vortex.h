@@ -52,7 +52,8 @@ static inline uint64_t rdinstret(void) { return CSR_READ(0xc02); }
 static inline uint64_t mlstat_read(void) { return CSR_READ(0x801); }
 static inline void mlstat_clear(void)  { CSR_WRITE(0x801, 1); }   // SAT is write-1-to-clear
 
-// Interrupts. crt0 calls irq_handler(mcause) for every interrupt; mcause is
+// Interrupts. crt0 calls irq_handler(mcause) for every interrupt (before ADR 0017
+// it was irq_handler(void): add the argument when porting older firmware); mcause is
 // MCAUSE_TIMER or MCAUSE_EXT. Both are level-triggered, so the handler must remove
 // the cause before it returns, or it is taken again at once.
 // Machine timer (ADR 0015): pending while CYCLE >= MTIMECMP; re-arm or disarm it.
@@ -68,6 +69,9 @@ static inline void timer_arm(uint64_t delta) { MTIMECMP = CYCLE + delta; }
 static inline void timer_disarm(void)       { MTIMECMP = ~0ULL; }
 static inline void irq_enable(void)  { CSR_SET(0x304, MIE_MTIE); CSR_SET(0x300, MSTATUS_MIE); }
 static inline void irq_disable(void) { CSR_CLEAR(0x300, MSTATUS_MIE); }
+// Machine external interrupt (ADR 0017): the capture/compare timer's capture interrupt
+static inline void ext_irq_enable(void)  { CSR_SET(0x304, MIE_MEIE); CSR_SET(0x300, MSTATUS_MIE); }
+static inline void ext_irq_disable(void) { CSR_CLEAR(0x304, MIE_MEIE); }
 
 // Capture/compare timer (ADR 0017; SoC built with CAPCMP=1). Register map and
 // rules: rtl/soc/vortex_capcmp.sv. Use 64-bit accesses only. Its capture

@@ -7,7 +7,7 @@
 // outputs out, with no software latency between the tick and the output.
 //
 // Registers (8 bytes apart; reads have no side effects, KNOWN-ISSUES I20):
-//   0x00 TIME       R   timer value
+//   0x00 TIME       R   timer value (read-only; set the rate with PRESC)
 //   0x08 PRESC      RW  timer tick = PRESC+1 clocks (16 bits); a write restarts the divider
 //   0x10 CTRL       RW  bits 2c+1:2c edge select of capture channel c (0 off, 1 rising,
 //                       2 falling, 3 both; resets to 1); bit 16 CAP_IE (external interrupt
@@ -32,8 +32,14 @@
 // Compare rules: a slot fires in the first clock where (TIME - tick), as a signed
 // TW-bit value, is >= 0, so a tick already in the past fires at once. Slots that
 // fire together on one output combine as: clear wins, then pulse (the highest
-// slot's length), then set. A pulse ends PULSE ticks after it fired, unless a
-// later action on that output replaces it. Outputs are registered.
+// slot's length), then set. A pulse ends CMP_ARG ticks after it fired, unless a
+// later action on that output replaces it: a pulse on an output already in a
+// pulse restarts the length from the new firing (overlapping pulses merge).
+// A push in the clock a slot fires may take that slot.
+//
+// Timing: an output changes one clock after TIME reaches its tick. A capture's
+// tick is TIME two clocks after the pin edge (the synchroniser), so a pin edge in
+// the last two clocks of a tick is stamped with the next tick.
 //
 // Capture rules: inputs are synchronised (2 flops). An edge latches the timer
 // in that channel's holding register; one held edge per clock enters the FIFO,
@@ -159,14 +165,14 @@ module vortex_capcmp #(
     for (int o = 0; o < N_OUT; o++) pulse_diff[o] = time_q - pulse_end[o];
   end
 
-  // Lowest free slot for a push
+  // Lowest free slot for a push; a slot firing this clock is free for it
   logic          has_free;
   logic [KW-1:0] free_idx;
   always_comb begin
     has_free = 1'b0;
     free_idx = '0;
     for (int k = N_CMP - 1; k >= 0; k--) begin
-      if (!slot_v[k]) begin
+      if (!slot_v[k] || fire[k]) begin
         has_free = 1'b1;
         free_idx = KW'(k);
       end

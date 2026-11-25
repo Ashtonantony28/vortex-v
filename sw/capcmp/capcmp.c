@@ -48,8 +48,7 @@ int main(void) {
     while (CC_CMP_STATUS & 0xff) { }         // fired (the output rises in the same clock)
     while (CC_OUT) { }                       // and ended, before the bench starts
     CC_CTRL = (CC_EDGE_RISE << 0) | (CC_EDGE_RISE << 2) | CC_CTRL_CAP_IE;
-    CSR_SET(0x304, MIE_MEIE);
-    CSR_SET(0x300, MSTATUS_MIE);
+    ext_irq_enable();
     LEDS = 1;                                // ready for edges
 
     uint64_t start = CYCLE;

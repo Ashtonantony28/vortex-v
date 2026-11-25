@@ -179,6 +179,21 @@ if cocotb is not None:
         assert await b.read(R_CMP_STATUS) & 0xFF == 0     # and the slot is free again
 
     @cocotb.test()
+    async def capcmp_push_takes_firing_slot(dut):
+        """With every slot busy, a push in the clock a slot fires takes that slot."""
+        b = Bench(dut)
+        await b.reset()
+        m = b.m
+        await b.write(R_PRESC, 0)
+        now = await b.read(R_TIME)
+        for _ in range(m.n_cmp - 1):
+            await b.write(R_CMP_PUSH, b.push_word(now + 1000, 0, ACT_SET))
+        await b.write(R_CMP_PUSH, b.push_word(now - 5, 0, ACT_SET))   # due: fires next clock
+        await b.write(R_CMP_PUSH, b.push_word(now + 1000, 0, ACT_SET))  # ... while this pushes
+        status = await b.read(R_CMP_STATUS)
+        assert status == m.n_cmp, f"CMP_STATUS {status:#x}: the push was dropped"
+
+    @cocotb.test()
     async def capcmp_pulse_length(dut):
         """A pulse of length L at tick T is high for exactly L ticks, from the edge that ends tick T."""
         b = Bench(dut)
